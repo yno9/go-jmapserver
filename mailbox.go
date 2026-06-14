@@ -118,6 +118,12 @@ func (s *Store) HandleMailboxSet(accountID jmap.ID, args json.RawMessage) (any, 
 		if mb.ID == "" {
 			mb.ID = jmap.ID("mbx-" + string(key))
 		}
+		if s.onSetMailbox != nil {
+			if err := s.onSetMailbox("create", mb.ID, &mb); err != nil {
+				notCreated[key] = errObj("serverFail", err.Error())
+				continue
+			}
+		}
 		mbs = append(mbs, mb)
 		mbByID[mb.ID] = &mb
 		created[key] = map[string]any{"id": mb.ID}
@@ -145,6 +151,12 @@ func (s *Store) HandleMailboxSet(accountID jmap.ID, args json.RawMessage) (any, 
 		if _, ok := mbByID[mbID]; !ok {
 			notDestroyed[mbID] = errObj("notFound", "mailbox not found")
 			continue
+		}
+		if s.onSetMailbox != nil {
+			if err := s.onSetMailbox("destroy", mbID, nil); err != nil {
+				notDestroyed[mbID] = errObj("serverFail", err.Error())
+				continue
+			}
 		}
 		destroySet[mbID] = true
 		destroyed = append(destroyed, mbID)

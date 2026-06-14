@@ -57,6 +57,11 @@ type SubmitEmailFunc func(msg email.Email, env emailsubmission.Envelope) error
 // Return an error to reject the operation.
 type SetIdentityFunc func(op string, id jmap.ID, data map[string]any) error
 
+// SetMailboxFunc is called for each Mailbox/set create or destroy.
+// op is "create" or "destroy"; mb is the mailbox (nil on destroy); id is the mailbox ID.
+// Return an error to reject the operation.
+type SetMailboxFunc func(op string, id jmap.ID, mb *mailbox.Mailbox) error
+
 type Store struct {
 	dir           string
 	mu            sync.RWMutex
@@ -70,6 +75,7 @@ type Store struct {
 	onCreate      CreateEmailFunc
 	onSubmit      SubmitEmailFunc
 	onSetIdentity SetIdentityFunc
+	onSetMailbox  SetMailboxFunc
 	vacation      map[string]any // in-memory VacationResponse
 }
 
@@ -82,6 +88,10 @@ func (s *Store) OnSubmitEmail(f SubmitEmailFunc) { s.onSubmit = f }
 // OnSetIdentity sets the hook called after each Identity/set operation.
 // Return an error to reject the operation.
 func (s *Store) OnSetIdentity(f SetIdentityFunc) { s.onSetIdentity = f }
+
+// OnSetMailbox sets the hook called for each Mailbox/set create or destroy.
+// Return an error to reject the operation.
+func (s *Store) OnSetMailbox(f SetMailboxFunc) { s.onSetMailbox = f }
 
 // NewStore opens (or creates) a store rooted at dir.
 func NewStore(dir string) (*Store, error) {
