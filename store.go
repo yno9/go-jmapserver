@@ -62,6 +62,15 @@ type SetIdentityFunc func(op string, id jmap.ID, data map[string]any) error
 // Return an error to reject the operation.
 type SetMailboxFunc func(op string, id jmap.ID, mb *mailbox.Mailbox) error
 
+// DestroyEmailFunc is called by HandleEmailSet for each Email/set destroy request.
+// id is the email being destroyed. Return an error to reject the operation.
+type DestroyEmailFunc func(id jmap.ID) error
+
+// UpdateEmailFunc is called by HandleEmailSet for each Email/set update request.
+// id is the email being updated; patch is the full patch object.
+// Return an error to reject the operation.
+type UpdateEmailFunc func(id jmap.ID, patch map[string]any) error
+
 type Store struct {
 	dir           string
 	mu            sync.RWMutex
@@ -76,6 +85,8 @@ type Store struct {
 	onSubmit      SubmitEmailFunc
 	onSetIdentity SetIdentityFunc
 	onSetMailbox  SetMailboxFunc
+	onDestroyEmail DestroyEmailFunc
+	onUpdateEmail  UpdateEmailFunc
 	vacation      map[string]any // in-memory VacationResponse
 }
 
@@ -92,6 +103,14 @@ func (s *Store) OnSetIdentity(f SetIdentityFunc) { s.onSetIdentity = f }
 // OnSetMailbox sets the hook called for each Mailbox/set create or destroy.
 // Return an error to reject the operation.
 func (s *Store) OnSetMailbox(f SetMailboxFunc) { s.onSetMailbox = f }
+
+// OnDestroyEmail sets the hook called for each Email/set destroy request.
+// Return an error to reject the operation.
+func (s *Store) OnDestroyEmail(f DestroyEmailFunc) { s.onDestroyEmail = f }
+
+// OnUpdateEmail sets the hook called for each Email/set update request.
+// Return an error to reject the operation.
+func (s *Store) OnUpdateEmail(f UpdateEmailFunc) { s.onUpdateEmail = f }
 
 // NewStore opens (or creates) a store rooted at dir.
 func NewStore(dir string) (*Store, error) {
@@ -280,6 +299,50 @@ func (s *Store) PatchKeywords(id jmap.ID, patch map[string]any) error {
 		if kw := strings.TrimPrefix(k, "keywords/"); kw != k {
 			if b, isBool := v.(bool); isBool {
 				cp.Keywords[kw] = b
+			}
+		}
+	}
+	s.msgs[id] = cp
+	s.state++
+	s.changes[s.state] = changeRecord{Updated: []jmap.ID{id}}
+	s.saveStateLocked()
+	s.mu.Unlock()
+
+	b, err := json.Marshal(cp)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.msgPath(id), b, 0644)
+}
+
+// PatchEmail applies a JMAP patch to a stored Email, handling both
+// keywords/* and mailboxIds/* patches, persists the change, and records an Updated entry.
+func (s *Store) PatchEmail(id jmap.ID, patch map[string]any) error {
+	s.mu.Lock()
+	m, ok := s.msgs[id]
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	cp := m
+	if cp.Keywords == nil {
+		cp.Keywords = map[string]bool{}
+	}
+	if cp.MailboxIDs == nil {
+		cp.MailboxIDs = map[jmap.ID]bool{}
+	}
+	for k, v := range patch {
+		if kw := strings.TrimPrefix(k, "keywords/"); kw != k {
+			if b, isBool := v.(bool); isBool {
+				cp.Keywords[kw] = b
+			} else if v == nil {
+				delete(cp.Keywords, kw)
+			}
+		} else if mb := strings.TrimPrefix(k, "mailboxIds/"); mb != k {
+			if b, isBool := v.(bool); isBool {
+				cp.MailboxIDs[jmap.ID(mb)] = b
+			} else if v == nil {
+				delete(cp.MailboxIDs, jmap.ID(mb))
 			}
 		}
 	}

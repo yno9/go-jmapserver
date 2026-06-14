@@ -240,7 +240,13 @@ func (s *Store) HandleEmailSet(accountID jmap.ID, args json.RawMessage) (any, er
 			notUpdated[msgID] = errObj("invalidProperties", err.Error())
 			continue
 		}
-		if err := s.PatchKeywords(msgID, patch); err != nil {
+		if s.onUpdateEmail != nil {
+			if err := s.onUpdateEmail(msgID, patch); err != nil {
+				notUpdated[msgID] = errObj("serverFail", err.Error())
+				continue
+			}
+		}
+		if err := s.PatchEmail(msgID, patch); err != nil {
 			notUpdated[msgID] = errObj("serverFail", err.Error())
 			continue
 		}
@@ -248,6 +254,12 @@ func (s *Store) HandleEmailSet(accountID jmap.ID, args json.RawMessage) (any, er
 	}
 
 	for _, msgID := range req.Destroy {
+		if s.onDestroyEmail != nil {
+			if err := s.onDestroyEmail(msgID); err != nil {
+				notDestroyed[msgID] = errObj("serverFail", err.Error())
+				continue
+			}
+		}
 		s.Delete(msgID)
 		destroyed = append(destroyed, msgID)
 	}
