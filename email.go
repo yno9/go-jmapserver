@@ -4,9 +4,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	jmap "git.sr.ht/~rockorager/go-jmap"
+	"git.sr.ht/~rockorager/go-jmap/mail"
+	"git.sr.ht/~rockorager/go-jmap/mail/email"
 )
+
+// emailMatchesText returns true if the email contains q (case-insensitive)
+// in subject, from/to name or email address, or plain-text body.
+func emailMatchesText(m email.Email, q string) bool {
+	q = strings.ToLower(q)
+	if strings.Contains(strings.ToLower(m.Subject), q) {
+		return true
+	}
+	for _, addrs := range [][]*mail.Address{m.From, m.To, m.CC} {
+		for _, a := range addrs {
+			if a == nil {
+				continue
+			}
+			if strings.Contains(strings.ToLower(a.Name), q) || strings.Contains(strings.ToLower(a.Email), q) {
+				return true
+			}
+		}
+	}
+	for _, bv := range m.BodyValues {
+		if bv != nil && strings.Contains(strings.ToLower(bv.Value), q) {
+			return true
+		}
+	}
+	return false
+}
 
 // HandleEmailGet implements Email/get: returns Emails by ID.
 func (s *Store) HandleEmailGet(accountID jmap.ID, args json.RawMessage) (any, error) {
@@ -38,12 +66,15 @@ func (s *Store) HandleEmailGet(accountID jmap.ID, args json.RawMessage) (any, er
 	}, nil
 }
 
-// HandleEmailQuery implements Email/query with optional filter (inMailbox), position, and limit.
+// HandleEmailQuery implements Email/query with optional filter (inMailbox, text), position, and limit.
 func (s *Store) HandleEmailQuery(accountID jmap.ID, args json.RawMessage) (any, error) {
 	var req struct {
-		Filter   *struct{ InMailbox string `json:"inMailbox"` } `json:"filter"`
-		Position int                                            `json:"position"`
-		Limit    uint64                                         `json:"limit"`
+		Filter   *struct {
+			InMailbox string `json:"inMailbox"`
+			Text      string `json:"text"`
+		} `json:"filter"`
+		Position int    `json:"position"`
+		Limit    uint64 `json:"limit"`
 	}
 	json.Unmarshal(args, &req) //nolint:errcheck
 
@@ -52,6 +83,11 @@ func (s *Store) HandleEmailQuery(accountID jmap.ID, args json.RawMessage) (any, 
 	for _, m := range all {
 		if req.Filter != nil && req.Filter.InMailbox != "" {
 			if !m.MailboxIDs[jmap.ID(req.Filter.InMailbox)] {
+				continue
+			}
+		}
+		if req.Filter != nil && req.Filter.Text != "" {
+			if !emailMatchesText(m, req.Filter.Text) {
 				continue
 			}
 		}

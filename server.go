@@ -100,14 +100,27 @@ func (h *Hub) unsubscribe(ch chan struct{}) {
 func NewMux(cfg Config, h Handler, hub *Hub) *http.ServeMux {
 	s := &srv{cfg: cfg, h: h}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/.well-known/jmap", s.auth(s.serveSession))
-	mux.HandleFunc("/jmap/api/", s.auth(s.serveAPI))
+	mux.HandleFunc("/.well-known/jmap", s.cors(s.auth(s.serveSession)))
+	mux.HandleFunc("/jmap/api/", s.cors(s.auth(s.serveAPI)))
 	if hub != nil {
-		mux.HandleFunc("/jmap/eventsource/", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("/jmap/eventsource/", s.cors(s.auth(func(w http.ResponseWriter, r *http.Request) {
 			serveEventSource(w, r, hub)
-		}))
+		})))
 	}
 	return mux
+}
+
+func (s *srv) cors(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // Serve starts the JMAP HTTP server and blocks until it returns an error.
@@ -129,15 +142,35 @@ type srv struct {
 
 func (s *srv) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.Username != "" {
-			u, p, ok := r.BasicAuth()
-			if !ok || u != s.cfg.Username || p != s.cfg.Password {
-				w.Header().Set("WWW-Authenticate", `Basic realm="jmap"`)
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if s.cfg.Password == "" {
+			next(w, r)
+			return
+		}
+		if tok := r.URL.Query().Get("access_token"); tok != "" {
+			if tok == s.cfg.Password {
+				next(w, r)
 				return
 			}
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
-		next(w, r)
+		a := r.Header.Get("Authorization")
+		if strings.HasPrefix(a, "Bearer ") {
+			if strings.TrimPrefix(a, "Bearer ") == s.cfg.Password {
+				next(w, r)
+				return
+			}
+			w.Header().Set("WWW-Authenticate", `Bearer realm="jmap"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		u, p, ok := r.BasicAuth()
+		if ok && (s.cfg.Username == "" || u == s.cfg.Username) && p == s.cfg.Password {
+			next(w, r)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="jmap"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
 }
 
@@ -345,7 +378,7 @@ func resolveRefs(args json.RawMessage, results map[string]json.RawMessage) (json
 	return json.Marshal(out)
 }
 
-// jsonPath extracts a value from JSON using a simple slash-delimited path (e.g. "/ids").
+// jsonPath extracts a value from JSON using a simple slash-delimited path (e.g. "/list/0/id").
 func jsonPath(data json.RawMessage, path string) (json.RawMessage, error) {
 	var cur any
 	if err := json.Unmarshal(data, &cur); err != nil {
@@ -355,13 +388,24 @@ func jsonPath(data json.RawMessage, path string) (json.RawMessage, error) {
 		if p == "" {
 			continue
 		}
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("expected object at %q", p)
-		}
-		cur, ok = m[p]
-		if !ok {
-			return nil, fmt.Errorf("key %q not found", p)
+		switch v := cur.(type) {
+		case map[string]any:
+			var ok bool
+			cur, ok = v[p]
+			if !ok {
+				return nil, fmt.Errorf("key %q not found", p)
+			}
+		case []any:
+			idx, err := strconv.Atoi(p)
+			if err != nil {
+				return nil, fmt.Errorf("expected array index at %q", p)
+			}
+			if idx < 0 || idx >= len(v) {
+				return nil, fmt.Errorf("index %d out of range (len %d)", idx, len(v))
+			}
+			cur = v[idx]
+		default:
+			return nil, fmt.Errorf("expected object or array at %q", p)
 		}
 	}
 	return json.Marshal(cur)
