@@ -1,6 +1,8 @@
 package jmapserver
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -23,9 +25,19 @@ type changeRecord struct {
 	Removed []jmap.ID
 }
 
+type mailboxChangeRecord struct {
+	Created   []jmap.ID
+	Updated   []jmap.ID
+	Destroyed []jmap.ID
+}
+
 type persistedState struct {
-	State   int64                   `json:"state"`
-	Changes map[string]changeRecord `json:"changes"`
+	State           int64                           `json:"state"`
+	Changes         map[string]changeRecord         `json:"changes"`
+	MailboxState    int64                           `json:"mailboxState"`
+	MailboxChanges  map[string]mailboxChangeRecord  `json:"mailboxChanges"`
+	Submissions     []map[string]any                `json:"submissions"`
+	SubmissionState int64                           `json:"submissionState"`
 }
 
 // Store is a disk-backed, in-memory-cached JMAP mail object store.
@@ -72,22 +84,27 @@ type DestroyEmailFunc func(id jmap.ID) error
 type UpdateEmailFunc func(id jmap.ID, patch map[string]any) error
 
 type Store struct {
-	dir           string
-	mu            sync.RWMutex
-	msgs          map[jmap.ID]email.Email // persisted
-	pending       map[jmap.ID]email.Email // in-memory only
-	state         int64
-	changes       map[int64]changeRecord
-	stateFile     string
-	identities    []map[string]any // persisted to identities.json
-	identityState int64
-	onCreate      CreateEmailFunc
-	onSubmit      SubmitEmailFunc
-	onSetIdentity SetIdentityFunc
-	onSetMailbox  SetMailboxFunc
-	onDestroyEmail DestroyEmailFunc
-	onUpdateEmail  UpdateEmailFunc
-	vacation      map[string]any // in-memory VacationResponse
+	dir             string
+	mu              sync.RWMutex
+	msgs            map[jmap.ID]email.Email // persisted
+	pending         map[jmap.ID]email.Email // in-memory only
+	state           int64
+	changes         map[int64]changeRecord
+	stateFile       string
+	identities      []map[string]any // persisted to identities.json
+	identityState   int64
+	onCreate        CreateEmailFunc
+	onSubmit        SubmitEmailFunc
+	onSetIdentity   SetIdentityFunc
+	onSetMailbox    SetMailboxFunc
+	onDestroyEmail  DestroyEmailFunc
+	onUpdateEmail   UpdateEmailFunc
+	vacation        map[string]any // in-memory VacationResponse
+	mailboxState    int64
+	mailboxChanges  map[int64]mailboxChangeRecord
+	blobs           map[string][]byte // blobID → raw bytes
+	submissions     []map[string]any
+	submissionState int64
 }
 
 // OnCreateEmail sets the hook called for Email/set create requests.
@@ -118,11 +135,13 @@ func NewStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:       dir,
-		msgs:      map[jmap.ID]email.Email{},
-		pending:   map[jmap.ID]email.Email{},
-		changes:   map[int64]changeRecord{},
-		stateFile: filepath.Join(dir, "delta.json"),
+		dir:            dir,
+		msgs:           map[jmap.ID]email.Email{},
+		pending:        map[jmap.ID]email.Email{},
+		changes:        map[int64]changeRecord{},
+		stateFile:      filepath.Join(dir, "delta.json"),
+		blobs:          map[string][]byte{},
+		mailboxChanges: map[int64]mailboxChangeRecord{},
 	}
 	entries, _ := os.ReadDir(filepath.Join(dir, "messages"))
 	for _, e := range entries {
@@ -161,15 +180,33 @@ func (s *Store) loadState() {
 			s.changes[n] = v
 		}
 	}
+	s.mailboxState = ps.MailboxState
+	s.submissionState = ps.SubmissionState
+	if ps.Submissions != nil {
+		s.submissions = ps.Submissions
+	}
+	for k, v := range ps.MailboxChanges {
+		n, err := strconv.ParseInt(k, 10, 64)
+		if err == nil {
+			s.mailboxChanges[n] = v
+		}
+	}
 }
 
 func (s *Store) saveStateLocked() {
 	ps := persistedState{
-		State:   s.state,
-		Changes: make(map[string]changeRecord, len(s.changes)),
+		State:           s.state,
+		Changes:         make(map[string]changeRecord, len(s.changes)),
+		MailboxState:    s.mailboxState,
+		MailboxChanges:  make(map[string]mailboxChangeRecord, len(s.mailboxChanges)),
+		Submissions:     s.submissions,
+		SubmissionState: s.submissionState,
 	}
 	for k, v := range s.changes {
 		ps.Changes[strconv.FormatInt(k, 10)] = v
+	}
+	for k, v := range s.mailboxChanges {
+		ps.MailboxChanges[strconv.FormatInt(k, 10)] = v
 	}
 	b, err := json.Marshal(ps)
 	if err != nil {
@@ -216,22 +253,22 @@ func (s *Store) Put(m email.Email) error {
 
 // resolveThreadID finds an existing thread via In-Reply-To / References,
 // or generates a new deterministic thread ID from the first Message-ID.
+// Angle brackets are stripped for comparison so <foo@bar> and foo@bar match.
 func (s *Store) resolveThreadID(m email.Email) jmap.ID {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// build messageID → threadID index from stored messages
+	// build messageID → threadID index (normalize: strip angle brackets)
 	byMsgID := make(map[string]jmap.ID, len(s.msgs))
 	for _, stored := range s.msgs {
 		for _, mid := range stored.MessageID {
-			if mid != "" {
-				byMsgID[mid] = stored.ThreadID
+			if k := strings.Trim(mid, "<>"); k != "" {
+				byMsgID[k] = stored.ThreadID
 			}
 		}
 	}
 	// walk In-Reply-To and References to find an existing thread
-	refs := append(m.InReplyTo, m.References...)
-	for _, ref := range refs {
-		if tid, ok := byMsgID[ref]; ok && tid != "" {
+	for _, ref := range append(m.InReplyTo, m.References...) {
+		if tid, ok := byMsgID[strings.Trim(ref, "<>")]; ok && tid != "" {
 			return tid
 		}
 	}
@@ -381,13 +418,54 @@ func (s *Store) TakePending(id jmap.ID) (email.Email, bool) {
 
 // ── mailboxes ─────────────────────────────────────────────────────────────────
 
-// PutMailboxes overwrites the persisted Mailbox list.
+// PutMailboxes overwrites the persisted Mailbox list. Does NOT bump
+// MailboxState; clients won't see the change via Mailbox/changes. Prefer
+// SyncMailboxes for relay-driven updates so JMAP clients get notified.
 func (s *Store) PutMailboxes(mbs []mailbox.Mailbox) error {
 	b, err := json.Marshal(mbs)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(s.dir, "mailboxes.json"), b, 0644)
+}
+
+// SyncMailboxes reconciles the stored Mailbox list against mbs (intended to
+// be the current authoritative view derived from the relay's config). If the
+// set of IDs differs, it overwrites the store and bumps MailboxState with a
+// proper change record so Mailbox/changes returns the diff. Idempotent: no-op
+// when the ID sets match.
+func (s *Store) SyncMailboxes(mbs []mailbox.Mailbox) error {
+	existing := s.Mailboxes()
+	existingByID := map[jmap.ID]bool{}
+	for _, mb := range existing {
+		existingByID[mb.ID] = true
+	}
+	newByID := map[jmap.ID]bool{}
+	for _, mb := range mbs {
+		newByID[mb.ID] = true
+	}
+
+	var created, destroyed []jmap.ID
+	for id := range newByID {
+		if !existingByID[id] {
+			created = append(created, id)
+		}
+	}
+	for id := range existingByID {
+		if !newByID[id] {
+			destroyed = append(destroyed, id)
+		}
+	}
+
+	if len(created) == 0 && len(destroyed) == 0 {
+		return nil
+	}
+
+	if err := s.PutMailboxes(mbs); err != nil {
+		return err
+	}
+	s.bumpMailboxState(mailboxChangeRecord{Created: created, Destroyed: destroyed})
+	return nil
 }
 
 // Mailboxes returns the persisted Mailbox list.
@@ -442,6 +520,89 @@ func (s *Store) defaultIdentity(accountID jmap.ID) map[string]any {
 		"htmlSignature": "",
 		"mayDelete":     false,
 	}
+}
+
+// ── mailbox state ─────────────────────────────────────────────────────────────
+
+// MailboxState returns the current mailbox state string.
+func (s *Store) MailboxState() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strconv.FormatInt(s.mailboxState, 10)
+}
+
+// mailboxChangesLocked returns the mailbox change log (caller must hold mu.RLock).
+func (s *Store) mailboxChangesLocked() map[int64]mailboxChangeRecord {
+	return s.mailboxChanges
+}
+
+// bumpMailboxState increments mailboxState and records a change. Must be called without mu held.
+func (s *Store) bumpMailboxState(rec mailboxChangeRecord) {
+	s.mu.Lock()
+	s.mailboxState++
+	s.mailboxChanges[s.mailboxState] = rec
+	s.saveStateLocked()
+	s.mu.Unlock()
+}
+
+// ── blobs ─────────────────────────────────────────────────────────────────────
+
+// PutBlob stores raw bytes and returns a stable blobID (sha256-based).
+func (s *Store) PutBlob(data []byte) string {
+	sum := sha256.Sum256(data)
+	id := "blob-" + hex.EncodeToString(sum[:])
+	s.mu.Lock()
+	s.blobs[id] = append([]byte(nil), data...)
+	s.mu.Unlock()
+	return id
+}
+
+// GetBlob retrieves a stored blob. Returns (data, ok).
+func (s *Store) GetBlob(id string) ([]byte, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b, ok := s.blobs[id]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), b...), true
+}
+
+// UploadBlob implements BlobHandler.UploadBlob for Store.
+func (s *Store) UploadBlob(contentType string, data []byte) string {
+	return s.PutBlob(data)
+}
+
+// DownloadBlob implements BlobHandler.DownloadBlob for Store.
+func (s *Store) DownloadBlob(blobID string) ([]byte, bool) {
+	return s.GetBlob(blobID)
+}
+
+// ── submissions ───────────────────────────────────────────────────────────────
+
+// AddSubmission stores a completed EmailSubmission record.
+func (s *Store) AddSubmission(sub map[string]any) {
+	s.mu.Lock()
+	s.submissions = append(s.submissions, sub)
+	s.submissionState++
+	s.saveStateLocked()
+	s.mu.Unlock()
+}
+
+// Submissions returns all stored EmailSubmission records.
+func (s *Store) Submissions() []map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]map[string]any, len(s.submissions))
+	copy(out, s.submissions)
+	return out
+}
+
+// SubmissionState returns the current EmailSubmission state string.
+func (s *Store) SubmissionState() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strconv.FormatInt(s.submissionState, 10)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

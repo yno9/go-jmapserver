@@ -13,9 +13,10 @@
 package jmapserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -25,18 +26,31 @@ import (
 	jmap "git.sr.ht/~rockorager/go-jmap"
 )
 
+type ctxKey int
+
+const ctxAccountID ctxKey = 0
+
 // Config is the HTTP server configuration.
 type Config struct {
-	Port     int    `json:"port"`
-	Bind     string `json:"bind,omitempty"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
+	ListenAddr string `json:"listen_addr,omitempty"`
+	Password   string `json:"password,omitempty"`
+	BaseURL    string `json:"base_url,omitempty"`
+	// AuthFunc authenticates a request. Returns the JMAP account ID and true on success.
+	// If nil, falls back to Password (single global password, all accounts accessible).
+	AuthFunc func(username, password string) (jmap.ID, bool) `json:"-"`
 }
 
 // Account describes a JMAP account exposed by the server.
 type Account struct {
 	ID   jmap.ID
 	Name string
+}
+
+// BlobHandler is optionally implemented by Handler to support blob upload/download.
+// If the Handler also implements BlobHandler, /jmap/upload/ and /jmap/download/ endpoints are activated.
+type BlobHandler interface {
+	UploadBlob(contentType string, data []byte) string
+	DownloadBlob(blobID string) (data []byte, ok bool)
 }
 
 // Handler is implemented by each protocol layer.
@@ -102,6 +116,10 @@ func NewMux(cfg Config, h Handler, hub *Hub) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/jmap", s.cors(s.auth(s.serveSession)))
 	mux.HandleFunc("/jmap/api/", s.cors(s.auth(s.serveAPI)))
+	if bh, ok := h.(BlobHandler); ok {
+		mux.HandleFunc("/jmap/upload/", s.cors(s.auth(serveBlobUpload(bh))))
+		mux.HandleFunc("/jmap/download/", s.cors(s.auth(serveBlobDownload(bh))))
+	}
 	if hub != nil {
 		mux.HandleFunc("/jmap/eventsource/", s.cors(s.auth(func(w http.ResponseWriter, r *http.Request) {
 			serveEventSource(w, r, hub)
@@ -126,10 +144,10 @@ func (s *srv) cors(next http.HandlerFunc) http.HandlerFunc {
 // Serve starts the JMAP HTTP server and blocks until it returns an error.
 // hub may be nil; if non-nil, a /jmap/eventsource/ SSE endpoint is added.
 func Serve(cfg Config, h Handler, hub *Hub) error {
-	if cfg.Port == 0 {
-		cfg.Port = 8765
+	addr := cfg.ListenAddr
+	if addr == "" {
+		addr = "0.0.0.0:8765"
 	}
-	addr := net.JoinHostPort(cfg.Bind, strconv.Itoa(cfg.Port))
 	return http.ListenAndServe(addr, NewMux(cfg, h, hub))
 }
 
@@ -142,39 +160,57 @@ type srv struct {
 
 func (s *srv) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.Password == "" {
-			next(w, r)
-			return
-		}
-		if tok := r.URL.Query().Get("access_token"); tok != "" {
-			if tok == s.cfg.Password {
-				next(w, r)
-				return
-			}
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		a := r.Header.Get("Authorization")
-		if strings.HasPrefix(a, "Bearer ") {
-			if strings.TrimPrefix(a, "Bearer ") == s.cfg.Password {
-				next(w, r)
-				return
-			}
+		username, password := s.extractCredentials(r)
+		accountID, ok := s.authenticate(username, password)
+		if !ok {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="jmap"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		u, p, ok := r.BasicAuth()
-		if ok && (s.cfg.Username == "" || u == s.cfg.Username) && p == s.cfg.Password {
-			next(w, r)
-			return
-		}
-		w.Header().Set("WWW-Authenticate", `Basic realm="jmap"`)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		ctx := context.WithValue(r.Context(), ctxAccountID, accountID)
+		next(w, r.WithContext(ctx))
 	}
 }
 
-func (s *srv) serveSession(w http.ResponseWriter, _ *http.Request) {
+func (s *srv) extractCredentials(r *http.Request) (username, password string) {
+	// Bearer token: "email:password" or legacy plain password
+	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
+		tok := strings.TrimPrefix(a, "Bearer ")
+		if parts := strings.SplitN(tok, ":", 2); len(parts) == 2 {
+			return parts[0], parts[1]
+		}
+		return "", tok
+	}
+	// Basic auth
+	if u, p, ok := r.BasicAuth(); ok {
+		return u, p
+	}
+	// access_token query param
+	if tok := r.URL.Query().Get("access_token"); tok != "" {
+		if parts := strings.SplitN(tok, ":", 2); len(parts) == 2 {
+			return parts[0], parts[1]
+		}
+		return "", tok
+	}
+	return "", ""
+}
+
+func (s *srv) authenticate(username, password string) (jmap.ID, bool) {
+	if s.cfg.AuthFunc != nil {
+		return s.cfg.AuthFunc(username, password)
+	}
+	// Legacy: single global password
+	if s.cfg.Password != "" {
+		if password != s.cfg.Password {
+			return "", false
+		}
+		return jmap.ID(username), true
+	}
+	// No auth configured
+	return jmap.ID(username), true
+}
+
+func (s *srv) serveSession(w http.ResponseWriter, r *http.Request) {
 	caps := s.h.Capabilities()
 
 	rawCaps := make(map[jmap.URI]json.RawMessage, len(caps)+1)
@@ -194,19 +230,24 @@ func (s *srv) serveSession(w http.ResponseWriter, _ *http.Request) {
 		acctCaps[uri] = json.RawMessage(`{}`)
 	}
 
-	accounts := s.h.Accounts()
-	jmapAccounts := make(map[jmap.ID]jmap.Account, len(accounts))
+	authedID, _ := r.Context().Value(ctxAccountID).(jmap.ID)
+
+	all := s.h.Accounts()
+	jmapAccounts := make(map[jmap.ID]jmap.Account, len(all))
 	primaryAccounts := make(map[jmap.URI]jmap.ID, len(caps))
 	username := ""
 
-	for i, a := range accounts {
+	for _, a := range all {
+		if authedID != "" && a.ID != authedID {
+			continue
+		}
 		jmapAccounts[a.ID] = jmap.Account{
 			Name:            a.Name,
 			IsPersonal:      true,
 			IsReadOnly:      false,
 			RawCapabilities: acctCaps,
 		}
-		if i == 0 {
+		if username == "" {
 			username = a.Name
 			for _, uri := range caps {
 				primaryAccounts[uri] = a.ID
@@ -214,9 +255,13 @@ func (s *srv) serveSession(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
-	base := "http://" + net.JoinHostPort(s.cfg.Bind, strconv.Itoa(s.cfg.Port))
-	if s.cfg.Bind == "" {
-		base = "http://localhost:" + strconv.Itoa(s.cfg.Port)
+	base := strings.TrimRight(s.cfg.BaseURL, "/")
+	if base == "" {
+		addr := s.cfg.ListenAddr
+		if addr == "" {
+			addr = "0.0.0.0:8765"
+		}
+		base = "http://" + addr
 	}
 	sess := jmap.Session{
 		RawCapabilities: rawCaps,
@@ -334,6 +379,50 @@ func errorResponse(name, callID, errType, desc string) json.RawMessage {
 func marshal(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func serveBlobUpload(bh BlobHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read error", http.StatusBadRequest)
+			return
+		}
+		ct := r.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		blobID := bh.UploadBlob(ct, data)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"blobId": blobID,
+			"type":   ct,
+			"size":   len(data),
+		})
+	}
+}
+
+func serveBlobDownload(bh BlobHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// URL: /jmap/download/{accountId}/{blobId}/{name}
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/jmap/download/"), "/")
+		if len(parts) < 2 {
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
+		}
+		blobID := parts[1]
+		data, ok := bh.DownloadBlob(blobID)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(data) //nolint:errcheck
+	}
 }
 
 // resolveRefs substitutes result-reference arguments (keys prefixed with "#").

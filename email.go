@@ -1,14 +1,25 @@
 package jmapserver
 
 import (
+	"bytes"
+	cryptorand "crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
+	stdmail "net/mail"
 	"strconv"
 	"strings"
+	"time"
 
 	jmap "git.sr.ht/~rockorager/go-jmap"
 	"git.sr.ht/~rockorager/go-jmap/mail"
 	"git.sr.ht/~rockorager/go-jmap/mail/email"
+	"git.sr.ht/~rockorager/go-jmap/mail/emailsubmission"
 )
 
 // emailMatchesText returns true if the email contains q (case-insensitive)
@@ -313,58 +324,418 @@ func (s *Store) HandleEmailSet(accountID jmap.ID, args json.RawMessage) (any, er
 	}, nil
 }
 
-// HandleEmailCopy implements Email/copy. Not supported; returns serverFail for all.
+// HandleEmailCopy implements Email/copy. Copies an email to a different mailbox.
 func (s *Store) HandleEmailCopy(accountID jmap.ID, args json.RawMessage) (any, error) {
 	var req struct {
-		Create map[jmap.ID]json.RawMessage `json:"create"`
+		FromAccountID jmap.ID `json:"fromAccountId"`
+		Create        map[jmap.ID]struct {
+			ID         jmap.ID          `json:"id"`
+			MailboxIDs map[jmap.ID]bool `json:"mailboxIds"`
+		} `json:"create"`
 	}
 	json.Unmarshal(args, &req) //nolint:errcheck
+
+	created := map[jmap.ID]any{}
 	notCreated := map[jmap.ID]any{}
-	for key := range req.Create {
-		notCreated[key] = errObj("serverFail", "Email/copy not supported")
+
+	for key, spec := range req.Create {
+		src, ok := s.Get(spec.ID)
+		if !ok {
+			notCreated[key] = errObj("notFound", fmt.Sprintf("email %q not found", spec.ID))
+			continue
+		}
+		cp := src
+		newID := jmap.ID(string(spec.ID) + "-cp-" + string(key))
+		cp.ID = newID
+		if len(spec.MailboxIDs) > 0 {
+			cp.MailboxIDs = spec.MailboxIDs
+		}
+		if err := s.Put(cp); err != nil {
+			notCreated[key] = errObj("serverFail", err.Error())
+			continue
+		}
+		created[key] = map[string]any{"id": newID}
+	}
+
+	fromID := req.FromAccountID
+	if fromID == "" {
+		fromID = accountID
 	}
 	return map[string]any{
-		"fromAccountId": accountID,
+		"fromAccountId": fromID,
 		"accountId":     accountID,
 		"oldState":      s.State(),
 		"newState":      s.State(),
-		"created":       map[jmap.ID]any{},
+		"created":       created,
 		"notCreated":    notCreated,
 	}, nil
 }
 
-// HandleEmailImport implements Email/import. Not supported; returns serverFail for all.
+// HandleEmailImport implements Email/import. Reads a blob, parses as MIME, creates Email.
 func (s *Store) HandleEmailImport(accountID jmap.ID, args json.RawMessage) (any, error) {
 	var req struct {
-		Emails map[jmap.ID]json.RawMessage `json:"emails"`
+		Emails map[jmap.ID]struct {
+			BlobID     jmap.ID          `json:"blobId"`
+			MailboxIDs map[jmap.ID]bool `json:"mailboxIds"`
+			Keywords   map[string]bool  `json:"keywords"`
+			ReceivedAt string           `json:"receivedAt"`
+		} `json:"emails"`
 	}
 	json.Unmarshal(args, &req) //nolint:errcheck
+
+	created := map[jmap.ID]any{}
 	notCreated := map[jmap.ID]any{}
-	for key := range req.Emails {
-		notCreated[key] = errObj("serverFail", "Email/import not supported")
+
+	for key, spec := range req.Emails {
+		data, ok := s.GetBlob(string(spec.BlobID))
+		if !ok {
+			notCreated[key] = errObj("notFound", fmt.Sprintf("blob %q not found", spec.BlobID))
+			continue
+		}
+		m, err := ParseMIMEEmail(data)
+		if err != nil {
+			notCreated[key] = errObj("invalidEmail", err.Error())
+			continue
+		}
+		m.ID = jmap.ID("import-" + string(key) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36))
+		if len(spec.MailboxIDs) > 0 {
+			m.MailboxIDs = spec.MailboxIDs
+		}
+		if len(spec.Keywords) > 0 {
+			m.Keywords = spec.Keywords
+		}
+		if spec.ReceivedAt != "" {
+			if t, err2 := time.Parse(time.RFC3339, spec.ReceivedAt); err2 == nil {
+				m.ReceivedAt = &t
+			}
+		}
+		if err := s.Put(m); err != nil {
+			notCreated[key] = errObj("serverFail", err.Error())
+			continue
+		}
+		created[key] = map[string]any{"id": m.ID}
 	}
+
 	return map[string]any{
 		"accountId":  accountID,
 		"oldState":   s.State(),
 		"newState":   s.State(),
-		"created":    map[jmap.ID]any{},
+		"created":    created,
 		"notCreated": notCreated,
 	}, nil
 }
 
-// HandleEmailParse implements Email/parse. Not supported; returns serverFail for all.
+// HandleEmailParse implements Email/parse. Reads a blob and returns parsed email preview.
 func (s *Store) HandleEmailParse(accountID jmap.ID, args json.RawMessage) (any, error) {
 	var req struct {
-		BlobIDs []jmap.ID `json:"blobIds"`
+		BlobIDs    []jmap.ID `json:"blobIds"`
+		Properties []string  `json:"properties"`
 	}
 	json.Unmarshal(args, &req) //nolint:errcheck
+
+	parsed := map[jmap.ID]any{}
 	notParsable := map[jmap.ID]any{}
-	for _, id := range req.BlobIDs {
-		notParsable[id] = errObj("serverFail", "Email/parse not supported")
+
+	for _, blobID := range req.BlobIDs {
+		data, ok := s.GetBlob(string(blobID))
+		if !ok {
+			notParsable[blobID] = errObj("notFound", fmt.Sprintf("blob %q not found", blobID))
+			continue
+		}
+		m, err := ParseMIMEEmail(data)
+		if err != nil {
+			notParsable[blobID] = errObj("notParsable", err.Error())
+			continue
+		}
+		parsed[blobID] = m
 	}
+
 	return map[string]any{
 		"accountId":   accountID,
-		"parsed":      map[jmap.ID]any{},
+		"parsed":      parsed,
 		"notParsable": notParsable,
 	}, nil
+}
+
+// ParseMIMEEmail parses raw RFC 5322 bytes into an email.Email struct.
+// Subject, From, To, MessageID, InReplyTo, References, and body are decoded
+// (quoted-printable, base64, encoded-words, multipart/alternative).
+// The caller must set ID, MailboxIDs, and ReceivedAt as appropriate.
+func ParseMIMEEmail(data []byte) (email.Email, error) {
+	msg, err := stdmail.ReadMessage(bytes.NewReader(data))
+	if err != nil {
+		return email.Email{}, err
+	}
+
+	dec := mime.WordDecoder{}
+	subject, _ := dec.DecodeHeader(msg.Header.Get("Subject"))
+	msgIDRaw := strings.Trim(msg.Header.Get("Message-Id"), " <>")
+	inReplyToRaw := strings.Trim(msg.Header.Get("In-Reply-To"), " <>")
+
+	date := time.Now()
+	if d, err2 := stdmail.ParseDate(msg.Header.Get("Date")); err2 == nil {
+		date = d
+	}
+
+	var fromAddrs []*mail.Address
+	if a, err2 := stdmail.ParseAddress(msg.Header.Get("From")); err2 == nil {
+		fromAddrs = []*mail.Address{{Email: a.Address, Name: a.Name}}
+	}
+	var toAddrs []*mail.Address
+	if addrs, err2 := stdmail.ParseAddressList(msg.Header.Get("To")); err2 == nil {
+		for _, a := range addrs {
+			toAddrs = append(toAddrs, &mail.Address{Email: a.Address, Name: a.Name})
+		}
+	}
+
+	bodyText := extractMIMEText(msg.Header.Get("Content-Type"), msg.Header.Get("Content-Transfer-Encoding"), msg.Body)
+
+	var msgIDs, inReplyTos, refs []string
+	if msgIDRaw != "" {
+		msgIDs = []string{msgIDRaw}
+	}
+	if inReplyToRaw != "" {
+		inReplyTos = []string{inReplyToRaw}
+	}
+	for _, r := range strings.Fields(msg.Header.Get("References")) {
+		if r = strings.Trim(r, "<>"); r != "" {
+			refs = append(refs, r)
+		}
+	}
+
+	partID := "1"
+	m := email.Email{
+		Subject:    subject,
+		From:       fromAddrs,
+		To:         toAddrs,
+		ReceivedAt: &date,
+		MessageID:  msgIDs,
+		InReplyTo:  inReplyTos,
+		References: refs,
+		Keywords:   map[string]bool{},
+		MailboxIDs: map[jmap.ID]bool{},
+		BodyValues: map[string]*email.BodyValue{
+			partID: {Value: bodyText},
+		},
+		TextBody: []*email.BodyPart{{
+			PartID: partID,
+			Type:   "text/plain",
+		}},
+	}
+	return m, nil
+}
+
+// extractMIMEText extracts the text/plain body from a MIME message.
+func extractMIMEText(contentType, contentEncoding string, body io.Reader) string {
+	if contentType == "" {
+		b, _ := io.ReadAll(body)
+		return strings.ReplaceAll(string(b), "\r\n", "\n")
+	}
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		b, _ := io.ReadAll(body)
+		return strings.ReplaceAll(string(b), "\r\n", "\n")
+	}
+	switch {
+	case mediaType == "text/plain":
+		b, _ := io.ReadAll(decodeMIMETransfer(contentEncoding, body))
+		return strings.ReplaceAll(string(b), "\r\n", "\n")
+	case mediaType == "multipart/encrypted":
+		// PGP/MIME (RFC 3156): extract the application/octet-stream part containing the PGP block.
+		// Skip any text/plain fallback to avoid storing plaintext server-side.
+		boundary := params["boundary"]
+		if boundary == "" {
+			return ""
+		}
+		mr := multipart.NewReader(body, boundary)
+		for {
+			part, err2 := mr.NextPart()
+			if err2 != nil {
+				break
+			}
+			partCT := part.Header.Get("Content-Type")
+			partMedia, _, _ := mime.ParseMediaType(partCT)
+			if partMedia == "application/octet-stream" || partMedia == "application/pgp-encrypted" {
+				b, _ := io.ReadAll(decodeMIMETransfer(part.Header.Get("Content-Transfer-Encoding"), part))
+				s := strings.ReplaceAll(string(b), "\r\n", "\n")
+				if strings.Contains(s, "-----BEGIN PGP MESSAGE-----") {
+					return s
+				}
+			}
+		}
+		return ""
+	case strings.HasPrefix(mediaType, "multipart/"):
+		boundary := params["boundary"]
+		if boundary == "" {
+			return ""
+		}
+		mr := multipart.NewReader(body, boundary)
+		for {
+			part, err2 := mr.NextPart()
+			if err2 != nil {
+				break
+			}
+			partCT := part.Header.Get("Content-Type")
+			if partCT == "" {
+				continue
+			}
+			partMedia, _, _ := mime.ParseMediaType(partCT)
+			if partMedia == "text/plain" {
+				b, _ := io.ReadAll(decodeMIMETransfer(part.Header.Get("Content-Transfer-Encoding"), part))
+				return strings.ReplaceAll(string(b), "\r\n", "\n")
+			}
+			// Recurse into nested multipart (e.g. multipart/mixed containing multipart/encrypted).
+			if strings.HasPrefix(partMedia, "multipart/") {
+				if nested := extractMIMEText(partCT, part.Header.Get("Content-Transfer-Encoding"), part); nested != "" {
+					return nested
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// decodeMIMETransfer wraps r with the appropriate Content-Transfer-Encoding decoder.
+func decodeMIMETransfer(encoding string, r io.Reader) io.Reader {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "quoted-printable":
+		return quotedprintable.NewReader(r)
+	case "base64":
+		return base64.NewDecoder(base64.StdEncoding, r)
+	}
+	return r
+}
+
+// MessageBody returns the text/plain body of an email.Email.
+func MessageBody(m email.Email) string {
+	if len(m.TextBody) > 0 && m.TextBody[0] != nil {
+		partID := m.TextBody[0].PartID
+		if bv, ok := m.BodyValues[partID]; ok && bv != nil {
+			return bv.Value
+		}
+	}
+	return ""
+}
+
+// BuildRFC5322 serializes an email.Email into RFC 5322 wire format suitable
+// for SMTP transmission. Generates a Message-ID if absent (using defaultDomain
+// for the right-hand side, or the From address domain). Returns the raw bytes
+// and the Message-ID (without angle brackets).
+//
+// Headers emitted: From, To, Cc, Subject, Date, Message-Id, In-Reply-To, References,
+// Content-Type. Body is the first text/plain BodyValue.
+func BuildRFC5322(e email.Email, defaultDomain string) ([]byte, string) {
+	from := ""
+	if len(e.From) > 0 && e.From[0] != nil {
+		from = formatAddr(e.From[0])
+	}
+	to := joinAddrs(e.To)
+	cc := joinAddrs(e.CC)
+
+	domain := defaultDomain
+	if domain == "" && len(e.From) > 0 && e.From[0] != nil {
+		if parts := strings.SplitN(e.From[0].Email, "@", 2); len(parts) == 2 {
+			domain = parts[1]
+		}
+	}
+	if domain == "" {
+		domain = "localhost"
+	}
+
+	msgID := ""
+	if len(e.MessageID) > 0 && e.MessageID[0] != "" {
+		msgID = strings.Trim(e.MessageID[0], "<>")
+	} else {
+		rnd := make([]byte, 6)
+		_, _ = cryptorand.Read(rnd)
+		msgID = fmt.Sprintf("%d.%s@%s", time.Now().UnixNano(), hex.EncodeToString(rnd), domain)
+	}
+
+	date := time.Now()
+	if e.SentAt != nil {
+		date = time.Time(*e.SentAt)
+	} else if e.ReceivedAt != nil {
+		date = time.Time(*e.ReceivedAt)
+	}
+
+	var b strings.Builder
+	if from != "" {
+		b.WriteString("From: " + from + "\r\n")
+	}
+	if to != "" {
+		b.WriteString("To: " + to + "\r\n")
+	}
+	if cc != "" {
+		b.WriteString("Cc: " + cc + "\r\n")
+	}
+	b.WriteString("Subject: " + e.Subject + "\r\n")
+	b.WriteString("Date: " + date.Format(time.RFC1123Z) + "\r\n")
+	b.WriteString("Message-Id: <" + msgID + ">\r\n")
+	if len(e.InReplyTo) > 0 {
+		b.WriteString("In-Reply-To: " + bracketJoin(e.InReplyTo) + "\r\n")
+	}
+	if len(e.References) > 0 {
+		b.WriteString("References: " + bracketJoin(e.References) + "\r\n")
+	}
+	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	b.WriteString("\r\n")
+	b.WriteString(MessageBody(e))
+	return []byte(b.String()), msgID
+}
+
+func formatAddr(a *mail.Address) string {
+	if a == nil || a.Email == "" {
+		return ""
+	}
+	return (&stdmail.Address{Name: a.Name, Address: a.Email}).String()
+}
+
+func joinAddrs(addrs []*mail.Address) string {
+	parts := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if s := formatAddr(a); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func bracketJoin(ids []string) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.Trim(id, " <>")
+		if id != "" {
+			parts = append(parts, "<"+id+">")
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// BuildEnvelope constructs an SMTP envelope from the email's From/To/CC/BCC headers.
+// Returns nil if From is absent or no recipients can be found.
+func BuildEnvelope(e email.Email) *emailsubmission.Envelope {
+	var mailFrom string
+	if len(e.From) > 0 && e.From[0] != nil {
+		mailFrom = e.From[0].Email
+	}
+	if mailFrom == "" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var rcpt []*emailsubmission.Address
+	for _, addrs := range [][]*mail.Address{e.To, e.CC, e.BCC} {
+		for _, a := range addrs {
+			if a != nil && a.Email != "" && !seen[a.Email] {
+				seen[a.Email] = true
+				rcpt = append(rcpt, &emailsubmission.Address{Email: a.Email})
+			}
+		}
+	}
+	if len(rcpt) == 0 {
+		return nil
+	}
+	return &emailsubmission.Envelope{
+		MailFrom: &emailsubmission.Address{Email: mailFrom},
+		RcptTo:   rcpt,
+	}
 }

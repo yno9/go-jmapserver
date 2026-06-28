@@ -2,6 +2,8 @@ package jmapserver
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 
 	jmap "git.sr.ht/~rockorager/go-jmap"
@@ -16,27 +18,63 @@ func (s *Store) HandleMailboxGet(accountID jmap.ID, args json.RawMessage) (any, 
 	}
 	return map[string]any{
 		"accountId": accountID,
-		"state":     "0",
+		"state":     s.MailboxState(),
 		"list":      mbs,
 		"notFound":  []string{},
 	}, nil
 }
 
-// HandleMailboxChanges implements Mailbox/changes.
-// Mailbox list is static (config-driven), so this always returns empty changes.
+// HandleMailboxChanges implements Mailbox/changes with proper state tracking.
 func (s *Store) HandleMailboxChanges(accountID jmap.ID, args json.RawMessage) (any, error) {
 	var req struct {
 		SinceState string `json:"sinceState"`
 	}
 	json.Unmarshal(args, &req) //nolint:errcheck
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	since, err := strconv.ParseInt(req.SinceState, 10, 64)
+	if err != nil || since < 0 {
+		return nil, fmt.Errorf("cannotCalculateChanges")
+	}
+	cur := s.mailboxState
+	if since > cur {
+		return nil, fmt.Errorf("cannotCalculateChanges")
+	}
+
+	createdSet := map[jmap.ID]bool{}
+	updatedSet := map[jmap.ID]bool{}
+	destroyedSet := map[jmap.ID]bool{}
+	for v := since + 1; v <= cur; v++ {
+		rec, ok := s.mailboxChanges[v]
+		if !ok {
+			return nil, fmt.Errorf("cannotCalculateChanges")
+		}
+		for _, id := range rec.Created {
+			createdSet[id] = true
+			delete(destroyedSet, id)
+		}
+		for _, id := range rec.Updated {
+			if !createdSet[id] {
+				updatedSet[id] = true
+			}
+		}
+		for _, id := range rec.Destroyed {
+			destroyedSet[id] = true
+			delete(createdSet, id)
+			delete(updatedSet, id)
+		}
+	}
+
 	return map[string]any{
 		"accountId":      accountID,
 		"oldState":       req.SinceState,
-		"newState":       req.SinceState,
+		"newState":       strconv.FormatInt(cur, 10),
 		"hasMoreChanges": false,
-		"created":        []jmap.ID{},
-		"updated":        []jmap.ID{},
-		"destroyed":      []jmap.ID{},
+		"created":        idsFromSet(createdSet),
+		"updated":        idsFromSet(updatedSet),
+		"destroyed":      idsFromSet(destroyedSet),
 	}, nil
 }
 
@@ -68,27 +106,69 @@ func (s *Store) HandleMailboxQuery(accountID jmap.ID, args json.RawMessage) (any
 	}
 	return map[string]any{
 		"accountId":           accountID,
-		"queryState":          "0",
-		"canCalculateChanges": false,
+		"queryState":          s.MailboxState(),
+		"canCalculateChanges": true,
 		"position":            0,
 		"ids":                 ids,
 		"total":               len(ids),
 	}, nil
 }
 
-// HandleMailboxQueryChanges implements Mailbox/queryChanges.
-// Mailboxes are static (config-driven), so always returns empty changes.
+// HandleMailboxQueryChanges implements Mailbox/queryChanges with state tracking.
 func (s *Store) HandleMailboxQueryChanges(accountID jmap.ID, args json.RawMessage) (any, error) {
 	var req struct {
 		SinceQueryState string `json:"sinceQueryState"`
 	}
 	json.Unmarshal(args, &req) //nolint:errcheck
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	since, err := strconv.ParseInt(req.SinceQueryState, 10, 64)
+	if err != nil || since < 0 {
+		return nil, fmt.Errorf("cannotCalculateChanges")
+	}
+	cur := s.mailboxState
+	if since > cur {
+		return nil, fmt.Errorf("cannotCalculateChanges")
+	}
+
+	addedSet := map[jmap.ID]bool{}
+	removedSet := map[jmap.ID]bool{}
+	for v := since + 1; v <= cur; v++ {
+		rec, ok := s.mailboxChanges[v]
+		if !ok {
+			return nil, fmt.Errorf("cannotCalculateChanges")
+		}
+		for _, id := range rec.Created {
+			addedSet[id] = true
+			delete(removedSet, id)
+		}
+		for _, id := range rec.Destroyed {
+			removedSet[id] = true
+			delete(addedSet, id)
+		}
+	}
+
+	var added []map[string]any
+	i := 0
+	for id := range addedSet {
+		added = append(added, map[string]any{"id": id, "index": i})
+		i++
+	}
+	removed := idsFromSet(removedSet)
+	if added == nil {
+		added = []map[string]any{}
+	}
+	if removed == nil {
+		removed = []jmap.ID{}
+	}
 	return map[string]any{
 		"accountId":     accountID,
 		"oldQueryState": req.SinceQueryState,
-		"newQueryState": req.SinceQueryState,
-		"removed":       []jmap.ID{},
-		"added":         []map[string]any{},
+		"newQueryState": strconv.FormatInt(cur, 10),
+		"removed":       removed,
+		"added":         added,
 	}, nil
 }
 
@@ -101,6 +181,7 @@ func (s *Store) HandleMailboxSet(accountID jmap.ID, args json.RawMessage) (any, 
 	}
 	json.Unmarshal(args, &req) //nolint:errcheck
 
+	oldState := s.MailboxState()
 	mbs := s.Mailboxes()
 	mbByID := make(map[jmap.ID]*mailbox.Mailbox, len(mbs))
 	for i := range mbs {
@@ -113,6 +194,9 @@ func (s *Store) HandleMailboxSet(accountID jmap.ID, args json.RawMessage) (any, 
 	notUpdated := map[jmap.ID]any{}
 	destroyed := []jmap.ID{}
 	notDestroyed := map[jmap.ID]any{}
+
+	var changeRec mailboxChangeRecord
+	changed := false
 
 	for key, mb := range req.Create {
 		if mb.ID == "" {
@@ -127,6 +211,8 @@ func (s *Store) HandleMailboxSet(accountID jmap.ID, args json.RawMessage) (any, 
 		mbs = append(mbs, mb)
 		mbByID[mb.ID] = &mb
 		created[key] = map[string]any{"id": mb.ID}
+		changeRec.Created = append(changeRec.Created, mb.ID)
+		changed = true
 	}
 
 	for mbID, rawPatch := range req.Update {
@@ -144,6 +230,8 @@ func (s *Store) HandleMailboxSet(accountID jmap.ID, args json.RawMessage) (any, 
 			mb.Name = name
 		}
 		updated[mbID] = map[string]any{}
+		changeRec.Updated = append(changeRec.Updated, mbID)
+		changed = true
 	}
 
 	destroySet := map[jmap.ID]bool{}
@@ -160,9 +248,11 @@ func (s *Store) HandleMailboxSet(accountID jmap.ID, args json.RawMessage) (any, 
 		}
 		destroySet[mbID] = true
 		destroyed = append(destroyed, mbID)
+		changeRec.Destroyed = append(changeRec.Destroyed, mbID)
+		changed = true
 	}
 
-	if len(req.Create) > 0 || len(req.Update) > 0 || len(destroySet) > 0 {
+	if changed {
 		var next []mailbox.Mailbox
 		for _, mb := range mbs {
 			if !destroySet[mb.ID] {
@@ -170,12 +260,13 @@ func (s *Store) HandleMailboxSet(accountID jmap.ID, args json.RawMessage) (any, 
 			}
 		}
 		s.PutMailboxes(next) //nolint:errcheck
+		s.bumpMailboxState(changeRec)
 	}
 
 	return map[string]any{
 		"accountId":    accountID,
-		"oldState":     "0",
-		"newState":     "0",
+		"oldState":     oldState,
+		"newState":     s.MailboxState(),
 		"created":      created,
 		"updated":      updated,
 		"destroyed":    destroyed,
