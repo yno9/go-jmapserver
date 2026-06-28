@@ -303,6 +303,33 @@ func (s *Store) Delete(id jmap.ID) {
 	os.Remove(s.msgPath(id)) //nolint:errcheck
 }
 
+// Purge removes every persisted Email — both from the in-memory index and
+// the on-disk messages directory. Intended for admin reset operations
+// (`biset sync --full` and similar); biset core then re-fetches from relays.
+// State counter is bumped once so clients on /jmap/eventsource/ re-sync.
+func (s *Store) Purge() {
+	s.mu.Lock()
+	removed := make([]jmap.ID, 0, len(s.msgs))
+	for id := range s.msgs {
+		removed = append(removed, id)
+	}
+	s.msgs = map[jmap.ID]email.Email{}
+	if len(removed) > 0 {
+		s.state++
+		s.changes[s.state] = changeRecord{Removed: removed}
+		s.saveStateLocked()
+	}
+	s.mu.Unlock()
+	dir := filepath.Join(s.dir, "messages")
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".json") {
+				os.Remove(filepath.Join(dir, e.Name())) //nolint:errcheck
+			}
+		}
+	}
+}
+
 // All returns all persisted Emails sorted newest-first by ReceivedAt.
 func (s *Store) All() []email.Email {
 	s.mu.RLock()

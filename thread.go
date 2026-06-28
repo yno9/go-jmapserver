@@ -11,6 +11,41 @@ import (
 	"git.sr.ht/~rockorager/go-jmap/mail/email"
 )
 
+// Thread is a lightweight summary of a thread: its ID and the message IDs it
+// contains in ReceivedAt order. Returned by AllThreads for callers that need
+// to enumerate threads without parsing JMAP method responses.
+type Thread struct {
+	ID       jmap.ID   `json:"id"`
+	EmailIDs []jmap.ID `json:"emailIds"`
+}
+
+// AllThreads returns every distinct ThreadID in the store with its member
+// EmailIDs (sorted by ReceivedAt). Threads themselves are not persisted —
+// this derives them from the message store on demand.
+func (s *Store) AllThreads() []Thread {
+	s.mu.RLock()
+	byThread := map[jmap.ID][]email.Email{}
+	for _, m := range s.msgs {
+		if m.ThreadID == "" {
+			continue
+		}
+		byThread[m.ThreadID] = append(byThread[m.ThreadID], m)
+	}
+	s.mu.RUnlock()
+	out := make([]Thread, 0, len(byThread))
+	for tid, msgs := range byThread {
+		sort.Slice(msgs, func(i, j int) bool {
+			return timeVal(msgs[i].ReceivedAt).Before(timeVal(msgs[j].ReceivedAt))
+		})
+		ids := make([]jmap.ID, len(msgs))
+		for i, m := range msgs {
+			ids[i] = m.ID
+		}
+		out = append(out, Thread{ID: tid, EmailIDs: ids})
+	}
+	return out
+}
+
 // AllForThread returns all persisted Emails with the given ThreadID, sorted by ReceivedAt.
 func (s *Store) AllForThread(threadID jmap.ID) []email.Email {
 	s.mu.RLock()
