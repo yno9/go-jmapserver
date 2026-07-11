@@ -38,6 +38,18 @@ type Config struct {
 	// AuthFunc authenticates a request. Returns the JMAP account ID and true on success.
 	// If nil, falls back to Password (single global password, all accounts accessible).
 	AuthFunc func(username, password string) (jmap.ID, bool) `json:"-"`
+	// VAPID keypair for Web Push (see push.go). Generate once per deployment
+	// with webpush.GenerateVAPIDKeys() and keep stable — rotating invalidates
+	// every client's subscription. Leave both empty to disable Web Push.
+	VapidPublicKey  string `json:"vapid_public_key,omitempty"`
+	VapidPrivateKey string `json:"vapid_private_key,omitempty"`
+	// VapidSubscriber is a contact identifying the sender, per RFC 8292 — a
+	// bare email address (e.g. "you@example.com") or an https: URL. Some push
+	// services (Apple's in particular) reject the send with 403 if this is
+	// left empty. Required alongside the keys above for Web Push to actually
+	// work, not just optional metadata. Do not include a "mailto:" prefix —
+	// see Hub.SetVAPIDKeys.
+	VapidSubscriber string `json:"vapid_subscriber,omitempty"`
 }
 
 // Account describes a JMAP account exposed by the server.
@@ -74,6 +86,15 @@ type Handler interface {
 type Hub struct {
 	mu   sync.Mutex
 	subs map[chan struct{}]bool
+
+	// Web Push (see push.go). Populated only if SetVAPIDKeys is called;
+	// otherwise Notify's push fan-out is a no-op.
+	pushMu          sync.Mutex
+	pushSubs        map[jmap.ID][]PushSubscription
+	pushDir         string
+	vapidPublic     string
+	vapidPrivate    string
+	vapidSubscriber string
 }
 
 // NewHub creates a new Hub.
@@ -81,7 +102,9 @@ func NewHub() *Hub {
 	return &Hub{subs: map[chan struct{}]bool{}}
 }
 
-// Notify sends a state-change event to all current SSE subscribers.
+// Notify sends a state-change event to all current SSE subscribers, and wakes
+// any registered Web Push subscriptions (see push.go) so backgrounded/closed
+// clients can refresh too.
 func (h *Hub) Notify() {
 	h.mu.Lock()
 	for ch := range h.subs {
@@ -91,6 +114,7 @@ func (h *Hub) Notify() {
 		}
 	}
 	h.mu.Unlock()
+	go h.pushAll()
 }
 
 func (h *Hub) subscribe() chan struct{} {
@@ -113,6 +137,9 @@ func (h *Hub) unsubscribe(ch chan struct{}) {
 // hub may be nil; if non-nil, a /jmap/eventsource/ SSE endpoint is added.
 func NewMux(cfg Config, h Handler, hub *Hub) *http.ServeMux {
 	s := &srv{cfg: cfg, h: h}
+	if hub != nil && cfg.VapidPublicKey != "" {
+		hub.SetVAPIDKeys(cfg.VapidPublicKey, cfg.VapidPrivateKey, cfg.VapidSubscriber)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/jmap", s.cors(s.auth(s.serveSession)))
 	mux.HandleFunc("/jmap/api/", s.cors(s.auth(s.serveAPI)))
@@ -124,6 +151,9 @@ func NewMux(cfg Config, h Handler, hub *Hub) *http.ServeMux {
 		mux.HandleFunc("/jmap/eventsource/", s.cors(s.auth(func(w http.ResponseWriter, r *http.Request) {
 			serveEventSource(w, r, hub)
 		})))
+		mux.HandleFunc("/jmap/push/vapid-public-key", s.cors(servePushVapidKey(hub)))
+		mux.HandleFunc("/jmap/push/subscribe", s.cors(s.auth(servePushSubscribe(hub))))
+		mux.HandleFunc("/jmap/push/unsubscribe", s.cors(s.auth(servePushUnsubscribe(hub))))
 	}
 	return mux
 }

@@ -487,6 +487,12 @@ func ParseMIMEEmail(data []byte) (email.Email, error) {
 			toAddrs = append(toAddrs, &mail.Address{Email: a.Address, Name: a.Name})
 		}
 	}
+	var ccAddrs []*mail.Address
+	if addrs, err2 := stdmail.ParseAddressList(msg.Header.Get("Cc")); err2 == nil {
+		for _, a := range addrs {
+			ccAddrs = append(ccAddrs, &mail.Address{Email: a.Address, Name: a.Name})
+		}
+	}
 
 	bodyText := extractMIMEText(msg.Header.Get("Content-Type"), msg.Header.Get("Content-Transfer-Encoding"), msg.Body)
 
@@ -503,15 +509,34 @@ func ParseMIMEEmail(data []byte) (email.Email, error) {
 		}
 	}
 
+	// Preserve non-standard headers (Chat-Group-ID, Chat-Group-Name, etc.)
+	standardHeaders := map[string]bool{
+		"from": true, "to": true, "cc": true, "bcc": true,
+		"subject": true, "date": true, "message-id": true,
+		"in-reply-to": true, "references": true,
+		"content-type": true, "content-transfer-encoding": true,
+		"mime-version": true, "autocrypt": true, "autocrypt-gossip": true,
+		"dkim-signature": true, "received": true, "return-path": true,
+		"chat-version": true,
+	}
+	var extraHeaders []*email.Header
+	for key, vals := range msg.Header {
+		if !standardHeaders[strings.ToLower(key)] && len(vals) > 0 {
+			extraHeaders = append(extraHeaders, &email.Header{Name: key, Value: vals[0]})
+		}
+	}
+
 	partID := "1"
 	m := email.Email{
 		Subject:    subject,
 		From:       fromAddrs,
 		To:         toAddrs,
+		CC:         ccAddrs,
 		ReceivedAt: &date,
 		MessageID:  msgIDs,
 		InReplyTo:  inReplyTos,
 		References: refs,
+		Headers:    extraHeaders,
 		Keywords:   map[string]bool{},
 		MailboxIDs: map[jmap.ID]bool{},
 		BodyValues: map[string]*email.BodyValue{
@@ -658,7 +683,14 @@ func BuildRFC5322(e email.Email, defaultDomain string) ([]byte, string) {
 		date = time.Time(*e.ReceivedAt)
 	}
 
+	// Prepend "Re: " on replies for MUA compatibility (thread subject convention).
+	subject := e.Subject
+	if len(e.InReplyTo) > 0 && subject != "" && !strings.HasPrefix(strings.ToLower(subject), "re:") {
+		subject = "Re: " + subject
+	}
+
 	var b strings.Builder
+	b.WriteString("MIME-Version: 1.0\r\n")
 	if from != "" {
 		b.WriteString("From: " + from + "\r\n")
 	}
@@ -668,7 +700,7 @@ func BuildRFC5322(e email.Email, defaultDomain string) ([]byte, string) {
 	if cc != "" {
 		b.WriteString("Cc: " + cc + "\r\n")
 	}
-	b.WriteString("Subject: " + e.Subject + "\r\n")
+	b.WriteString("Subject: " + subject + "\r\n")
 	b.WriteString("Date: " + date.Format(time.RFC1123Z) + "\r\n")
 	b.WriteString("Message-Id: <" + msgID + ">\r\n")
 	if len(e.InReplyTo) > 0 {
@@ -676,6 +708,17 @@ func BuildRFC5322(e email.Email, defaultDomain string) ([]byte, string) {
 	}
 	if len(e.References) > 0 {
 		b.WriteString("References: " + bracketJoin(e.References) + "\r\n")
+	}
+	// Custom headers (Chat-Group-ID, Chat-Group-Name, etc.)
+	skip := map[string]bool{
+		"from": true, "to": true, "cc": true, "subject": true,
+		"date": true, "message-id": true, "in-reply-to": true,
+		"references": true, "content-type": true,
+	}
+	for _, h := range e.Headers {
+		if !skip[strings.ToLower(h.Name)] {
+			b.WriteString(h.Name + ": " + h.Value + "\r\n")
+		}
 	}
 	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
 	b.WriteString("\r\n")
@@ -687,7 +730,15 @@ func formatAddr(a *mail.Address) string {
 	if a == nil || a.Email == "" {
 		return ""
 	}
-	return (&stdmail.Address{Name: a.Name, Address: a.Email}).String()
+	name := a.Name
+	if name == "" {
+		// Fall back to the localpart as display name for MUA compatibility
+		// (bare "<addr>" without a display name confuses some clients' reply-all).
+		if i := strings.IndexByte(a.Email, '@'); i > 0 {
+			name = a.Email[:i]
+		}
+	}
+	return (&stdmail.Address{Name: name, Address: a.Email}).String()
 }
 
 func joinAddrs(addrs []*mail.Address) string {

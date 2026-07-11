@@ -104,7 +104,21 @@ func (s *Store) HandleIdentitySet(accountID jmap.ID, args json.RawMessage) (any,
 
 	for idKey, raw := range req.Update {
 		idx, ok := byID[string(idKey)]
-		if !ok {
+		var base map[string]any
+		if ok {
+			base = s.identities[idx]
+		} else if string(idKey) == "identity-"+string(accountID) {
+			// Identity/get synthesizes this default on the fly whenever the
+			// account has no real identity yet (see defaultIdentity) — it's
+			// never actually stored. A client editing "its identity" (e.g.
+			// changing the display name) naturally targets this id, since
+			// that's the id Identity/get just handed it. Without this,
+			// every such update looks like it works (JMAP call succeeds,
+			// just lands in notUpdated) but silently does nothing, and the
+			// next Identity/get re-synthesizes the untouched original —
+			// upsert instead of rejecting as notFound.
+			base = s.defaultIdentity(accountID)
+		} else {
 			notUpdated[idKey] = errObj("notFound", "identity not found")
 			continue
 		}
@@ -113,20 +127,29 @@ func (s *Store) HandleIdentitySet(accountID jmap.ID, args json.RawMessage) (any,
 			notUpdated[idKey] = errObj("invalidProperties", err.Error())
 			continue
 		}
-		merged := make(map[string]any, len(s.identities[idx]))
-		for k, v := range s.identities[idx] {
+		merged := make(map[string]any, len(base))
+		for k, v := range base {
 			merged[k] = v
 		}
 		for k, v := range patch {
 			merged[k] = v
 		}
 		if s.onSetIdentity != nil {
-			if err := s.onSetIdentity("update", idKey, merged); err != nil {
+			op := "update"
+			if !ok {
+				op = "create"
+			}
+			if err := s.onSetIdentity(op, idKey, merged); err != nil {
 				notUpdated[idKey] = errObj("serverFail", err.Error())
 				continue
 			}
 		}
-		s.identities[idx] = merged
+		if ok {
+			s.identities[idx] = merged
+		} else {
+			s.identities = append(s.identities, merged)
+			byID[string(idKey)] = len(s.identities) - 1
+		}
 		s.identityState++
 		updated[idKey] = map[string]any{}
 	}

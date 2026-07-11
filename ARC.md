@@ -53,16 +53,39 @@ mux.HandleFunc("/my-route", myHandler)
 http.ListenAndServe(addr, mux)
 ```
 
-`hub` may be nil; if non-nil, `/jmap/eventsource/` SSE endpoint is added.
+`hub` may be nil; if non-nil, `/jmap/eventsource/` SSE endpoint is added, along with the Web Push endpoints below.
 
 ### Hub (`server.go`)
 
 ```go
 hub := jmapserver.NewHub()
-hub.Notify()   // broadcast state-change to all SSE subscribers
+hub.Notify()   // broadcast state-change to all SSE subscribers + registered Web Push subscriptions
 ```
 
-Call `hub.Notify()` whenever new data arrives (IMAP IDLE, HTTP POST, RSS poll, …). Connected clients receive a `state` SSE event and re-fetch.
+Call `hub.Notify()` whenever new data arrives (IMAP IDLE, HTTP POST, RSS poll, …). Connected clients receive a `state` SSE event and re-fetch. `Notify()` also fans out to any Web Push subscriptions registered on the hub (see below) — this is the *only* thing a relay needs to call; there is no separate push-specific notify path.
+
+### Web Push (`push.go`)
+
+Piggybacks on `Notify()` so relays get background wake-ups for free — no relay-specific code needed beyond configuring VAPID keys and (optionally) persistence.
+
+```go
+hub.SetVAPIDKeys(cfg.VapidPublicKey, cfg.VapidPrivateKey)  // done automatically by NewMux/Serve if cfg carries them
+hub.SetPersistDir(dataDir)                                 // optional: survive restarts (push_subs.json)
+```
+
+`Config.VapidPublicKey` / `VapidPrivateKey` (both `json:"vapid_public_key"` / `"vapid_private_key"`) are read by `NewMux`/`Serve`: if `VapidPublicKey` is non-empty, `hub.SetVAPIDKeys` is called automatically. Generate a pair with `go run ./cmd/vapidgen` — keep it stable (rotating invalidates every client subscription).
+
+**Important**: an identity's push subscription lives at the *client's own origin*, not the relay's — one browser subscription, tied to one VAPID keypair. If an identity spans multiple relays (e.g. mail + ActivityPub on the same home domain), every relay it touches must be configured with the **same** VAPID keypair, or that relay's push sends will fail to authenticate against the subscription. VAPID keys are therefore scoped per client-app deployment (home domain), copied identically into each relay's config — not generated independently per relay.
+
+Endpoints (added to `NewMux` when `hub != nil`):
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /jmap/push/vapid-public-key` | none | Serves the configured public key so the client can call `PushManager.subscribe({applicationServerKey})` |
+| `POST /jmap/push/subscribe` | yes | Body `{endpoint, keys:{p256dh,auth}}` — registers a subscription against the authenticated accountID |
+| `POST /jmap/push/unsubscribe` | yes | Body `{endpoint}` — removes it |
+
+The push payload sent on `Notify()` is always empty. The relay only knows its own store's unread count, not an identity's total across every relay it has an account on — so the payload can't carry a badge number without risking one relay's push clobbering another's. Instead it's purely a wake-up signal: the client's Service Worker, which knows about every relay the identity uses, re-fetches and computes the true total itself before setting the badge. A subscription that 404s/410s on send is treated as gone and pruned automatically.
 
 ---
 
