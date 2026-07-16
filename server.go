@@ -171,6 +171,29 @@ func (s *srv) cors(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// WrapCORS sets permissive CORS headers on EVERY response the handler
+// produces, including ones from routes with no registered handler (a bare
+// http.ServeMux's default 404 carries no CORS headers). Without this, a
+// client probing an optional route this relay doesn't implement — e.g. biset
+// checking /pgp/privkey on a relay that isn't a mail relay, or on any
+// third-party relay of an unknown type — gets an opaque browser-level
+// "blocked by CORS policy" instead of a plain, readable 404. Per-route s.cors
+// still exists for handlers that also need OPTIONS preflight short-circuiting;
+// this is the outermost wrapper around the whole mux, applied once at
+// ListenAndServe, so it covers routes s.cors never even sees.
+func WrapCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 // Serve starts the JMAP HTTP server and blocks until it returns an error.
 // hub may be nil; if non-nil, a /jmap/eventsource/ SSE endpoint is added.
 func Serve(cfg Config, h Handler, hub *Hub) error {
@@ -365,9 +388,17 @@ func (s *srv) serveAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveEventSource(w http.ResponseWriter, r *http.Request, hub *Hub) {
+	// No "Connection: keep-alive" here — over HTTP/2 (which browsers use by
+	// default when the connection is served over TLS, i.e. via Cloudflare)
+	// hop-by-hop headers like Connection are a protocol violation per RFC
+	// 7540 §8.1.2.2, and Go's http2 server treats writing one as a stream
+	// error, RST_STREAMing it — surfaces in Chrome as exactly
+	// net::ERR_HTTP2_PROTOCOL_ERROR on this eventsource request, right after
+	// the 200 status line already went out. HTTP/1.1 keep-alive is handled
+	// automatically by net/http regardless; this header was never doing
+	// anything useful even there.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "event: state\ndata: {\"changed\":{\"urn:ietf:params:jmap:mail\":null}}\n\n")
 	if f, ok := w.(http.Flusher); ok {

@@ -254,7 +254,27 @@ func (s *Store) Put(m email.Email) error {
 // resolveThreadID finds an existing thread via In-Reply-To / References,
 // or generates a new deterministic thread ID from the first Message-ID.
 // Angle brackets are stripped for comparison so <foo@bar> and foo@bar match.
+//
+// DeltaChat groups are a flat chat with no threading concept at all — unlike
+// a 1:1 conversation, there's no reply-to-a-specific-message UI, just one
+// continuous stream — so a group message's thread_id is just its group id,
+// full stop, bypassing the In-Reply-To/References walk entirely. Relying on
+// reply-chains for groups was actively wrong, not just unnecessary: DeltaChat
+// splits one logical text+image message into two separate MIME messages that
+// both reference a common parent, and if that parent isn't something we
+// happen to have stored (e.g. it predates this account joining, or was never
+// delivered to this relay), each half independently falls through to "no
+// parent found" and mints its OWN thread id from its own Message-ID —
+// splitting one message in two threads (2026-07-14, user-reported, live
+// example: two messages sharing in-reply-to 24680954-1bee-45ae-b787-
+// 966a0a522e09@localhost landing in different threads because that message
+// was never in the store to resolve against).
 func (s *Store) resolveThreadID(m email.Email) jmap.ID {
+	for _, h := range m.Headers {
+		if strings.EqualFold(h.Name, "Chat-Group-Id") && h.Value != "" {
+			return jmap.ID("thr-group-" + h.Value)
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	// build messageID → threadID index (normalize: strip angle brackets)
@@ -305,9 +325,11 @@ func (s *Store) Delete(id jmap.ID) {
 
 // Purge removes every persisted Email — both from the in-memory index and
 // the on-disk messages directory. Intended for admin reset operations
-// (`biset sync --full` and similar); biset core then re-fetches from relays.
-// State counter is bumped once so clients on /jmap/eventsource/ re-sync.
-func (s *Store) Purge() {
+// (`biset sync --full` and similar) and the "how your data is stored"
+// purge-messages feature; biset core then re-fetches from relays. State
+// counter is bumped once so clients on /jmap/eventsource/ re-sync. Returns
+// how many messages were removed.
+func (s *Store) Purge() int {
 	s.mu.Lock()
 	removed := make([]jmap.ID, 0, len(s.msgs))
 	for id := range s.msgs {
@@ -328,6 +350,7 @@ func (s *Store) Purge() {
 			}
 		}
 	}
+	return len(removed)
 }
 
 // All returns all persisted Emails sorted newest-first by ReceivedAt.

@@ -134,7 +134,8 @@ store.State()                    // current queryState string
 ### Thread ID resolution (`Put`)
 
 `Put` resolves `ThreadID` automatically if not set:
-1. Walk `InReplyTo` + `References` against stored messages' `MessageID`
+0. If a `Chat-Group-Id` header is present (DeltaChat group message — preserved on `Email.Headers` like any other non-standard header, see email.go): `"thr-group-" + that value`, full stop, skipping the walk below entirely. A group is a flat chat with no threading concept — there's no "reply to a specific message" UI, just one continuous stream — so thread id should just BE the group id. Doing this via reply-chain-walking instead is actively wrong, not just redundant: DeltaChat splits one logical text+image message into two separate MIME messages that both reference a common parent, and if that parent was never delivered to (or already pruned from) this relay, each half independently falls through to step 3 below and mints its own thread id — one message visibly split into two threads client-side.
+1. Otherwise, walk `InReplyTo` + `References` against stored messages' `MessageID`
 2. If match found: inherit that thread's ID
 3. Otherwise: `"thr-" + MessageID[0]` (or `"thr-" + ID` as fallback)
 
