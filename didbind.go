@@ -6,22 +6,17 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"strings"
-	"time"
 )
 
-// Signature-based DID→relay binding verification (biset DID.md third-party
-// portability). A client proves control of a DID by signing, with the DID's ROOT
-// key, the host-bound statement:
+// Recovering the ed25519 public key a did:dht identifier names — the DID *is*
+// the key, z-base-32 encoded.
 //
-//	bind:<did>:<username>@<relayHost>:<unixSeconds>
-//
-// The relay verifies the signature against the DID's own public key (the
-// z-base-32 suffix of did:dht:<key>), so no secret is ever revealed. Host-binding
-// + a freshness window stop a captured signature from being replayed elsewhere.
-
-const didBindWindow = 300 * time.Second
+// This used to also verify DID→relay bindings, but that moved to the anchor
+// (ANCHOR.md decision 1: the anchor verifies, relays forward the proof — see
+// AnchorClaim/BindingProof). What's left is the key decoding itself, which the
+// account-delete path still needs for a reason unrelated to identity proof: to
+// name the pkarr gateway entry to forget.
 
 // zBase32 alphabet (Zooko) — identical to pkarr / biset client / go-jmapserver/pkarr.
 const zAlphabet = "ybndrfg8ejkmcpqxot1uwisza345h769"
@@ -71,27 +66,6 @@ func DIDPublicKey(did string) (ed25519.PublicKey, error) {
 		return nil, err
 	}
 	return ed25519.PublicKey(pk), nil
-}
-
-// VerifyDIDBinding checks that sigB64 is a valid root-key signature over the
-// binding statement for (did, username, relayHost, ts), and that ts is fresh.
-func VerifyDIDBinding(did, username, relayHost string, ts int64, sigB64 string) error {
-	if d := time.Since(time.Unix(ts, 0)); d > didBindWindow || d < -didBindWindow {
-		return errors.New("binding timestamp out of window")
-	}
-	pk, err := DIDPublicKey(did)
-	if err != nil {
-		return err
-	}
-	sig, err := base64.StdEncoding.DecodeString(sigB64)
-	if err != nil {
-		return fmt.Errorf("bad signature encoding: %w", err)
-	}
-	stmt := fmt.Sprintf("bind:%s:%s@%s:%d", did, username, relayHost, ts)
-	if !ed25519.Verify(pk, []byte(stmt), sig) {
-		return errors.New("binding signature invalid")
-	}
-	return nil
 }
 
 // HashAuthToken is the per-account credential the relay stores (base64 of the
