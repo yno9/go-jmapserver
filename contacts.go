@@ -55,8 +55,7 @@ type Card struct {
 // per-account directory the relay already scopes everything else to
 // (dataDir/domain/localpart), passed explicitly rather than via a *Store so
 // the HTTP layer (which only knows domain/localpart, per relay auth) doesn't
-// need a Store lookup callback plumbed through — same style as didindex.go's
-// LookupLocalDID/RecordLocalDID.
+// need a Store lookup callback plumbed through.
 
 func contactsPath(accountDir string) string { return filepath.Join(accountDir, "contacts.json") }
 
