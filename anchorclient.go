@@ -17,11 +17,9 @@ import (
 // **The token is not optional.** The anchor is on the public internet — it has
 // to be, because clients reach its DIDComm mediator directly — and its registry
 // decides who owns which address. Without a shared secret anyone who can reach
-// it can claim a name nobody has, or DELETE the claim of somebody who does and
-// take it, DNS record and all. Nothing about a claim identifies the caller
-// otherwise: a fingerprint-only claim carries no proof by design (backfill and
-// envelope rotation have no DID to prove), so "can reach the anchor" was the
-// entire authorization story.
+// it can DELETE the claim of somebody who has one and take it, DNS record and
+// all — a release names no key and proves nothing, so "can reach the anchor"
+// was the entire authorization story for it.
 //
 // This is the piece ANCHOR.md's threat model missed. It argued the anchor may
 // trust a relay's word about r.Host because "a lying relay could already claim
@@ -68,33 +66,34 @@ type BindingProof struct {
 }
 
 // AnchorClaim asks the (optional, standalone) identity anchor service to
-// claim/verify localpart+domain for the given fingerprint and/or DID — the
-// shared HTTP client both jmapap and jmapsmtp use, so relays that want DID
-// identity coordination don't each reimplement this. A relay that never sets
-// an anchor URL simply never calls this (see DID.md "DID is optional" /
-// "no-core").
+// record which DID owns localpart+domain — the shared HTTP client both jmapap
+// and jmapsmtp use, so relays that want DID identity coordination don't each
+// reimplement this. A relay that never sets an anchor URL simply never calls
+// this (see DID.md "DID is optional" / "no-core").
 //
 // domain is the real address domain (e.g. t.biset.md) — distinct from the
 // anchor's own host, since one anchor instance serves every domain a relay
 // family provisions under.
 //
-// proof is nil for claims that carry no signature: a fingerprint-only claim
-// (backfill, envelope rotation) has no DID to prove, and lazy DID migration
-// (PUT /account/did) authenticates with the account's own credential instead.
-// Only account provisioning has a fresh signature to forward.
+// A DID and its proof are the only things there is to claim by, and both are
+// mandatory. This used to take an envelope fingerprint too, for accounts with no
+// DID — nothing read it, and an account with no DID publishes nothing a claim
+// could protect. Its removal took the proof-less claim with it: every caller now
+// has a signature, the anchor 401s a DID without one, so an optional proof could
+// only ever have meant "fail".
 //
-// Returns "ok" (claim recorded or matched), "conflict" (name held by a
-// different key, or a DID mismatch), "invalid" (the anchor rejected the
-// binding proof — bad signature, wrong host, or stale timestamp), or "error"
-// (anchor unreachable, refusing this relay, or a bad response).
-func AnchorClaim(a AnchorRef, localpart, domain, fp, did string, proof *BindingProof) string {
-	payload := map[string]any{"domain": domain, "fingerprint": fp, "did": did}
-	if proof != nil {
-		payload["did_sig"] = proof.Sig
-		payload["bind_ts"] = proof.TS
-		payload["host"] = proof.Host
-	}
-	body, _ := json.Marshal(payload)
+// Returns "ok" (claim recorded or matched), "conflict" (the name is held by a
+// different DID), "invalid" (the anchor rejected the binding proof — bad
+// signature, wrong host, or stale timestamp), or "error" (anchor unreachable,
+// refusing this relay, or a bad response).
+func AnchorClaim(a AnchorRef, localpart, domain, did string, proof BindingProof) string {
+	body, _ := json.Marshal(map[string]any{
+		"domain":  domain,
+		"did":     did,
+		"did_sig": proof.Sig,
+		"bind_ts": proof.TS,
+		"host":    proof.Host,
+	})
 	req, err := a.request(http.MethodPost, "/identity/"+localpart, body)
 	if err != nil {
 		return "error"
