@@ -27,7 +27,7 @@ func TestAnchorClaimForwardsBindingProof(t *testing.T) {
 	defer srv.Close()
 
 	proof := &BindingProof{Sig: "c2ln", TS: 1752700000, Host: "mail.biset.md"}
-	if r := AnchorClaim(srv.URL, "alice", "biset.md", "", "did:dht:abc", proof); r != "ok" {
+	if r := AnchorClaim(AnchorRef{URL: srv.URL, Token: "t"}, "alice", "biset.md", "", "did:dht:abc", proof); r != "ok" {
 		t.Fatalf("AnchorClaim = %q, want ok", r)
 	}
 	for k, want := range map[string]any{
@@ -56,7 +56,7 @@ func TestAnchorClaimWithoutProofOmitsProofKeys(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if r := AnchorClaim(srv.URL, "alice", "biset.md", "fp", "", nil); r != "ok" {
+	if r := AnchorClaim(AnchorRef{URL: srv.URL, Token: "t"}, "alice", "biset.md", "fp", "", nil); r != "ok" {
 		t.Fatalf("AnchorClaim = %q, want ok", r)
 	}
 	for _, k := range []string{"did_sig", "bind_ts", "host"} {
@@ -83,23 +83,51 @@ func TestAnchorClaimStatusMapping(t *testing.T) {
 		{http.StatusConflict, "conflict"},
 		{http.StatusUnauthorized, "invalid"},
 		{http.StatusServiceUnavailable, "error"},
+		{http.StatusForbidden, "error"}, // this relay turned away — never reported as a client-side proof failure
 		{http.StatusInternalServerError, "error"},
 		{http.StatusBadRequest, "error"},
 	} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(tc.status)
 		}))
-		if r := AnchorClaim(srv.URL, "alice", "biset.md", "", "did:dht:abc", nil); r != tc.want {
+		if r := AnchorClaim(AnchorRef{URL: srv.URL, Token: "t"}, "alice", "biset.md", "", "did:dht:abc", nil); r != tc.want {
 			t.Errorf("status %d -> %q, want %q", tc.status, r, tc.want)
 		}
 		srv.Close()
 	}
 }
 
+// Every write carries the relay's token. Without it the anchor's registry is
+// writable by anyone who can reach it — and it is reachable by everyone, since
+// its DIDComm mediator has to be.
+func TestAnchorWritesCarryTheRelayToken(t *testing.T) {
+	var claimAuth, releaseAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			releaseAuth = r.Header.Get("Authorization")
+		} else {
+			claimAuth = r.Header.Get("Authorization")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ref := AnchorRef{URL: srv.URL, Token: "s3cr3t"}
+	AnchorClaim(ref, "alice", "biset.md", "fp", "", nil)
+	AnchorRelease(ref, "alice", "biset.md")
+
+	if claimAuth != "Bearer s3cr3t" {
+		t.Errorf("claim Authorization = %q, want %q", claimAuth, "Bearer s3cr3t")
+	}
+	if releaseAuth != "Bearer s3cr3t" {
+		t.Errorf("release Authorization = %q, want %q — an unauthenticated DELETE is how a claim gets taken from its owner", releaseAuth, "Bearer s3cr3t")
+	}
+}
+
 // An unreachable anchor must be distinguishable from every rejection, because
 // provisioning refuses on it rather than treating it as a verdict.
 func TestAnchorClaimUnreachable(t *testing.T) {
-	if r := AnchorClaim("http://127.0.0.1:1", "alice", "biset.md", "", "did:dht:abc", nil); r != "error" {
+	if r := AnchorClaim(AnchorRef{URL: "http://127.0.0.1:1", Token: "t"}, "alice", "biset.md", "", "did:dht:abc", nil); r != "error" {
 		t.Fatalf("AnchorClaim = %q, want error", r)
 	}
 }

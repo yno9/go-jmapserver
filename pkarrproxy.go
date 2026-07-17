@@ -28,11 +28,11 @@ import (
 // Nothing here understands DIDs: the key is an opaque path segment and the body
 // an opaque blob. Validation, signature checking and the DHT all live at the
 // far end.
-func RegisterPkarrProxy(mux *http.ServeMux, anchorURL string) {
-	if anchorURL == "" {
+func RegisterPkarrProxy(mux *http.ServeMux, a AnchorRef) {
+	if a.URL == "" {
 		return // anchorless: no DHT gateway to reach (ANCHOR.md decision 2)
 	}
-	base := strings.TrimRight(anchorURL, "/") + "/pkarr/"
+	base := strings.TrimRight(a.URL, "/") + "/pkarr/"
 	// Generous next to the anchor's own 30s DHT timeout: a traversal that is
 	// still going is worth waiting for, and the client already treats a failure
 	// as "try the next gateway".
@@ -62,6 +62,11 @@ func RegisterPkarrProxy(mux *http.ServeMux, anchorURL string) {
 			return
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
+		// The anchor's /pkarr is for its own relays, not the world: this route is
+		// the public face, and forwarding without the token would leave the anchor
+		// a gateway anyone could spend — and, per resolver.ts's privacy note, one
+		// that sees strangers' lookups too.
+		req.Header.Set("Authorization", "Bearer "+a.Token)
 		resp, err := client.Do(req)
 		if err != nil {
 			http.Error(w, "pkarr gateway unreachable", http.StatusBadGateway)

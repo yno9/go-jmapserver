@@ -11,6 +11,44 @@ import (
 	"time"
 )
 
+// AnchorRef is where this relay's anchor lives and how it proves it is allowed
+// to write there.
+//
+// **The token is not optional.** The anchor is on the public internet — it has
+// to be, because clients reach its DIDComm mediator directly — and its registry
+// decides who owns which address. Without a shared secret anyone who can reach
+// it can claim a name nobody has, or DELETE the claim of somebody who does and
+// take it, DNS record and all. Nothing about a claim identifies the caller
+// otherwise: a fingerprint-only claim carries no proof by design (backfill and
+// envelope rotation have no DID to prove), so "can reach the anchor" was the
+// entire authorization story.
+//
+// This is the piece ANCHOR.md's threat model missed. It argued the anchor may
+// trust a relay's word about r.Host because "a lying relay could already claim
+// anything it liked on the anchor" — true, but the premise underneath it was
+// that only relays talk to the anchor. Nothing enforced that. Now something
+// does.
+type AnchorRef struct {
+	URL   string // empty = anchorless; this relay serves no DID identities
+	Token string // shared with the anchor's relay_token
+}
+
+func (a AnchorRef) request(method, path string, body []byte) (*http.Request, error) {
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, strings.TrimRight(a.URL, "/")+path, r)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+a.Token)
+	return req, nil
+}
+
 // BindingProof is a client's root-key signature over the host-bound statement
 //
 //	bind:<did>:<username>@<host>:<ts>
@@ -36,8 +74,8 @@ type BindingProof struct {
 // an anchor URL simply never calls this (see DID.md "DID is optional" /
 // "no-core").
 //
-// domain is the real address domain (e.g. t.biset.md) — distinct from
-// anchorURL's own host, since one anchor instance serves every domain a relay
+// domain is the real address domain (e.g. t.biset.md) — distinct from the
+// anchor's own host, since one anchor instance serves every domain a relay
 // family provisions under.
 //
 // proof is nil for claims that carry no signature: a fingerprint-only claim
@@ -48,8 +86,8 @@ type BindingProof struct {
 // Returns "ok" (claim recorded or matched), "conflict" (name held by a
 // different key, or a DID mismatch), "invalid" (the anchor rejected the
 // binding proof — bad signature, wrong host, or stale timestamp), or "error"
-// (anchor unreachable/bad response).
-func AnchorClaim(anchorURL, localpart, domain, fp, did string, proof *BindingProof) string {
+// (anchor unreachable, refusing this relay, or a bad response).
+func AnchorClaim(a AnchorRef, localpart, domain, fp, did string, proof *BindingProof) string {
 	payload := map[string]any{"domain": domain, "fingerprint": fp, "did": did}
 	if proof != nil {
 		payload["did_sig"] = proof.Sig
@@ -57,9 +95,12 @@ func AnchorClaim(anchorURL, localpart, domain, fp, did string, proof *BindingPro
 		payload["host"] = proof.Host
 	}
 	body, _ := json.Marshal(payload)
-	url := strings.TrimRight(anchorURL, "/") + "/identity/" + localpart
+	req, err := a.request(http.MethodPost, "/identity/"+localpart, body)
+	if err != nil {
+		return "error"
+	}
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := client.Do(req)
 	if err != nil {
 		return "error"
 	}
@@ -77,6 +118,14 @@ func AnchorClaim(anchorURL, localpart, domain, fp, did string, proof *BindingPro
 		reason, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		log.Printf("[anchor] rejected binding for %s@%s: %s", localpart, domain, strings.TrimSpace(string(reason)))
 		return "invalid"
+	case http.StatusForbidden:
+		// Not the client's fault and not something they can fix: this relay is
+		// the one being turned away. Distinct from 401 precisely so it cannot be
+		// reported to a user as "your DID proof was rejected" — the proof was
+		// never looked at. Provisioning treats it like any other anchor failure
+		// and refuses rather than proceeding unanchored.
+		log.Printf("[anchor] REFUSED THIS RELAY (%s) — check anchor_token against the anchor's relay_token", a.URL)
+		return "error"
 	default:
 		return "error"
 	}
@@ -90,12 +139,11 @@ func AnchorClaim(anchorURL, localpart, domain, fp, did string, proof *BindingPro
 // account's stale claim would never go away otherwise. Best-effort like every
 // other anchor call here: an unreachable anchor must never block the
 // surrounding account-delete flow, so errors are swallowed.
-func AnchorRelease(anchorURL, localpart, domain string) {
-	if anchorURL == "" {
+func AnchorRelease(a AnchorRef, localpart, domain string) {
+	if a.URL == "" {
 		return
 	}
-	reqURL := strings.TrimRight(anchorURL, "/") + "/identity/" + localpart + "?domain=" + url.QueryEscape(domain)
-	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
+	req, err := a.request(http.MethodDelete, "/identity/"+localpart+"?domain="+url.QueryEscape(domain), nil)
 	if err != nil {
 		return
 	}
@@ -103,6 +151,9 @@ func AnchorRelease(anchorURL, localpart, domain string) {
 	resp, err := client.Do(req)
 	if err != nil {
 		return
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		log.Printf("[anchor] REFUSED THIS RELAY (%s) on release of %s@%s — check anchor_token", a.URL, localpart, domain)
 	}
 	resp.Body.Close()
 }
