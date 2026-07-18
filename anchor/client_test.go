@@ -1,4 +1,4 @@
-package jmapserver
+package anchor
 
 import (
 	"encoding/json"
@@ -12,7 +12,7 @@ import (
 // signature over a statement built from them. Renaming one, or letting bind_ts
 // go out as a string, fails no build and no other test — it just makes every DID
 // account creation 401 in production. So the wire format is pinned here.
-func TestAnchorClaimForwardsBindingProof(t *testing.T) {
+func TestClaimForwardsBindingProof(t *testing.T) {
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/identity/alice" {
@@ -27,8 +27,8 @@ func TestAnchorClaimForwardsBindingProof(t *testing.T) {
 	defer srv.Close()
 
 	proof := BindingProof{Sig: "c2ln", TS: 1752700000, Host: "mail.biset.md"}
-	if r := AnchorClaim(AnchorRef{URL: srv.URL, Token: "t"}, "alice", "biset.md", "did:dht:abc", proof); r != "ok" {
-		t.Fatalf("AnchorClaim = %q, want ok", r)
+	if r := Claim(Ref{URL: srv.URL, Token: "t"}, "alice", "biset.md", "did:dht:abc", proof); r != "ok" {
+		t.Fatalf("Claim = %q, want ok", r)
 	}
 	for k, want := range map[string]any{
 		"domain":  "biset.md",
@@ -46,7 +46,7 @@ func TestAnchorClaimForwardsBindingProof(t *testing.T) {
 // A claim carries a DID and its proof, and nothing else. There is no proof-less
 // claim any more: the envelope fingerprint that used to stand in for one is
 // gone, so every claim rides a signature and the anchor 401s anything without.
-func TestAnchorClaimCarriesProofNeverFingerprint(t *testing.T) {
+func TestClaimCarriesProofNeverFingerprint(t *testing.T) {
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -56,8 +56,8 @@ func TestAnchorClaimCarriesProofNeverFingerprint(t *testing.T) {
 	defer srv.Close()
 
 	proof := BindingProof{Sig: "c2ln", TS: 1752700000, Host: "mail.biset.md"}
-	if r := AnchorClaim(AnchorRef{URL: srv.URL, Token: "t"}, "alice", "biset.md", "did:dht:abc", proof); r != "ok" {
-		t.Fatalf("AnchorClaim = %q, want ok", r)
+	if r := Claim(Ref{URL: srv.URL, Token: "t"}, "alice", "biset.md", "did:dht:abc", proof); r != "ok" {
+		t.Fatalf("Claim = %q, want ok", r)
 	}
 	if got["did"] != "did:dht:abc" || got["did_sig"] != "c2ln" || got["host"] != "mail.biset.md" {
 		t.Errorf("proof not forwarded: %#v", got)
@@ -71,7 +71,7 @@ func TestAnchorClaimCarriesProofNeverFingerprint(t *testing.T) {
 // client's fault (401), "conflict" is someone else's name (409), "error" is the
 // anchor's fault (503, and provisioning refuses rather than proceeds unanchored).
 // Collapsing any pair would either leak a name or accept an unproven DID.
-func TestAnchorClaimStatusMapping(t *testing.T) {
+func TestClaimStatusMapping(t *testing.T) {
 	for _, tc := range []struct {
 		status int
 		want   string
@@ -88,7 +88,7 @@ func TestAnchorClaimStatusMapping(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(tc.status)
 		}))
-		if r := AnchorClaim(AnchorRef{URL: srv.URL, Token: "t"}, "alice", "biset.md", "did:dht:abc", BindingProof{Sig: "s"}); r != tc.want {
+		if r := Claim(Ref{URL: srv.URL, Token: "t"}, "alice", "biset.md", "did:dht:abc", BindingProof{Sig: "s"}); r != tc.want {
 			t.Errorf("status %d -> %q, want %q", tc.status, r, tc.want)
 		}
 		srv.Close()
@@ -98,7 +98,7 @@ func TestAnchorClaimStatusMapping(t *testing.T) {
 // Every write carries the relay's token. Without it the anchor's registry is
 // writable by anyone who can reach it — and it is reachable by everyone, since
 // its DIDComm mediator has to be.
-func TestAnchorWritesCarryTheRelayToken(t *testing.T) {
+func TestWritesCarryTheRelayToken(t *testing.T) {
 	var claimAuth, releaseAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
@@ -110,9 +110,9 @@ func TestAnchorWritesCarryTheRelayToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ref := AnchorRef{URL: srv.URL, Token: "s3cr3t"}
-	AnchorClaim(ref, "alice", "biset.md", "did:dht:abc", BindingProof{Sig: "s"})
-	AnchorRelease(ref, "alice", "biset.md")
+	ref := Ref{URL: srv.URL, Token: "s3cr3t"}
+	Claim(ref, "alice", "biset.md", "did:dht:abc", BindingProof{Sig: "s"})
+	Release(ref, "alice", "biset.md")
 
 	if claimAuth != "Bearer s3cr3t" {
 		t.Errorf("claim Authorization = %q, want %q", claimAuth, "Bearer s3cr3t")
@@ -124,8 +124,8 @@ func TestAnchorWritesCarryTheRelayToken(t *testing.T) {
 
 // An unreachable anchor must be distinguishable from every rejection, because
 // provisioning refuses on it rather than treating it as a verdict.
-func TestAnchorClaimUnreachable(t *testing.T) {
-	if r := AnchorClaim(AnchorRef{URL: "http://127.0.0.1:1", Token: "t"}, "alice", "biset.md", "did:dht:abc", BindingProof{Sig: "s"}); r != "error" {
-		t.Fatalf("AnchorClaim = %q, want error", r)
+func TestClaimUnreachable(t *testing.T) {
+	if r := Claim(Ref{URL: "http://127.0.0.1:1", Token: "t"}, "alice", "biset.md", "did:dht:abc", BindingProof{Sig: "s"}); r != "error" {
+		t.Fatalf("Claim = %q, want error", r)
 	}
 }

@@ -1,4 +1,4 @@
-package jmapserver
+package anchor
 
 import (
 	"io"
@@ -28,7 +28,7 @@ import (
 // Nothing here understands DIDs: the key is an opaque path segment and the body
 // an opaque blob. Validation, signature checking and the DHT all live at the
 // far end.
-func RegisterPkarrProxy(mux *http.ServeMux, a AnchorRef) {
+func RegisterPkarrProxy(mux *http.ServeMux, a Ref) {
 	if a.URL == "" {
 		return // anchorless: no DHT gateway to reach (ANCHOR.md decision 2)
 	}

@@ -114,10 +114,27 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v) //nolint:errcheck
 }
 
-// listAccounts walks <DataDir>/<domain>/<localpart>, the same layout the metrics
-// collector uses, and summarizes each account.
-func listAccounts(dataDir string) []accountSummary {
-	out := []accountSummary{}
+// BearerAuth guards next with a static bearer token (no-op when token is ""),
+// exported so a relay can protect its own admin-token routes — the anchor drain
+// endpoint mounts outside RegisterAdmin but must answer to the same ADMIN_TOKEN.
+func BearerAuth(token string, next http.Handler) http.Handler {
+	return bearerAuth(token, next)
+}
+
+// AccountRef identifies one provisioned address, without the message and usage
+// stats accountSummary gathers. Enough to release its claim or route to it.
+type AccountRef struct {
+	Domain    string `json:"domain"`
+	Localpart string `json:"localpart"`
+}
+
+// ListProvisioned walks <DataDir>/<domain>/<localpart> — the same layout the
+// metrics collector and listAccounts use — and returns every provisioned
+// address. It is the cheap read: callers that only need identities (draining
+// claims from the anchor) should not pay to stat every mailbox. "peers" is a
+// sibling-relay bookkeeping directory, not an account, so it is skipped.
+func ListProvisioned(dataDir string) []AccountRef {
+	out := []AccountRef{}
 	domains, err := os.ReadDir(dataDir)
 	if err != nil {
 		return out
@@ -132,11 +149,21 @@ func listAccounts(dataDir string) []accountSummary {
 			continue
 		}
 		for _, a := range accts {
-			if !a.IsDir() {
+			if !a.IsDir() || a.Name() == "peers" {
 				continue
 			}
-			out = append(out, accountSummaryFor(dataDir, domain, a.Name()))
+			out = append(out, AccountRef{Domain: domain, Localpart: a.Name()})
 		}
+	}
+	return out
+}
+
+// listAccounts summarizes every provisioned account for the admin dashboard.
+func listAccounts(dataDir string) []accountSummary {
+	refs := ListProvisioned(dataDir)
+	out := make([]accountSummary, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, accountSummaryFor(dataDir, r.Domain, r.Localpart))
 	}
 	return out
 }

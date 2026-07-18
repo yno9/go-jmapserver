@@ -1,4 +1,13 @@
-package jmapserver
+// Package anchor is a relay's client for the standalone identity anchor
+// (biset-anchor): the DID-coordination layer that jmapap and jmapsmtp share.
+//
+// It lives apart from package jmapserver on purpose. jmapserver is the JMAP
+// core; anchoring is orthogonal to it, and a relay built without this package
+// (`go build -tags noanchor`) is a pure JMAP server that speaks no DID at all —
+// no claim, no release, no /pkarr, no /account/did. Nothing in package
+// jmapserver imports this, so that exclusion is a compile-time fact, not a
+// runtime flag.
+package anchor
 
 import (
 	"bytes"
@@ -11,8 +20,8 @@ import (
 	"time"
 )
 
-// AnchorRef is where this relay's anchor lives and how it proves it is allowed
-// to write there.
+// Ref is where this relay's anchor lives and how it proves it is allowed to
+// write there.
 //
 // **The token is not optional.** The anchor is on the public internet — it has
 // to be, because clients reach its DIDComm mediator directly — and its registry
@@ -26,12 +35,12 @@ import (
 // anything it liked on the anchor" — true, but the premise underneath it was
 // that only relays talk to the anchor. Nothing enforced that. Now something
 // does.
-type AnchorRef struct {
+type Ref struct {
 	URL   string // empty = anchorless; this relay serves no DID identities
 	Token string // shared with the anchor's relay_token
 }
 
-func (a AnchorRef) request(method, path string, body []byte) (*http.Request, error) {
+func (a Ref) request(method, path string, body []byte) (*http.Request, error) {
 	var r io.Reader
 	if body != nil {
 		r = bytes.NewReader(body)
@@ -65,11 +74,9 @@ type BindingProof struct {
 	Host string // r.Host, verbatim
 }
 
-// AnchorClaim asks the (optional, standalone) identity anchor service to
-// record which DID owns localpart+domain — the shared HTTP client both jmapap
-// and jmapsmtp use, so relays that want DID identity coordination don't each
-// reimplement this. A relay that never sets an anchor URL simply never calls
-// this (see DID.md "DID is optional" / "no-core").
+// Claim asks the identity anchor service to record which DID owns
+// localpart+domain — the shared HTTP client both jmapap and jmapsmtp use, so
+// relays that want DID identity coordination don't each reimplement this.
 //
 // domain is the real address domain (e.g. t.biset.md) — distinct from the
 // anchor's own host, since one anchor instance serves every domain a relay
@@ -86,7 +93,7 @@ type BindingProof struct {
 // different DID), "invalid" (the anchor rejected the binding proof — bad
 // signature, wrong host, or stale timestamp), or "error" (anchor unreachable,
 // refusing this relay, or a bad response).
-func AnchorClaim(a AnchorRef, localpart, domain, did string, proof BindingProof) string {
+func Claim(a Ref, localpart, domain, did string, proof BindingProof) string {
 	body, _ := json.Marshal(map[string]any{
 		"domain":  domain,
 		"did":     did,
@@ -130,29 +137,42 @@ func AnchorClaim(a AnchorRef, localpart, domain, did string, proof BindingProof)
 	}
 }
 
-// AnchorRelease tells the anchor to forget localpart+domain's claim — call
-// when an account is permanently deleted, so the address becomes claimable
-// again. Without this, a legitimate future registration of the same address
-// (by anyone, including its original owner under a new identity) would be
-// rejected by AnchorClaim as a false "different key" conflict — the deleted
-// account's stale claim would never go away otherwise. Best-effort like every
-// other anchor call here: an unreachable anchor must never block the
-// surrounding account-delete flow, so errors are swallowed.
-func AnchorRelease(a AnchorRef, localpart, domain string) {
+// Release tells the anchor to forget localpart+domain's claim — call when an
+// account is permanently deleted, so the address becomes claimable again.
+// Without this, a legitimate future registration of the same address (by
+// anyone, including its original owner under a new identity) would be rejected
+// by Claim as a false "different key" conflict — the deleted account's stale
+// claim would never go away otherwise. Best-effort like every other anchor call
+// here: an unreachable anchor must never block the surrounding account-delete
+// flow, so the outcome is discarded.
+func Release(a Ref, localpart, domain string) {
+	releaseOK(a, localpart, domain)
+}
+
+// releaseOK performs the DELETE and reports whether the anchor confirmed it.
+// Release throws the result away — an unreachable anchor must not block an
+// account deletion — but Drain needs it: a release it could not confirm means
+// the claim may still stand, and a relay must not believe it has gone anchorless
+// cleanly when it hasn't. Release is idempotent at the anchor (deleting an
+// address that holds no claim is a 2xx no-op), so this says "clear at the
+// anchor", not "there was a claim and we removed it".
+func releaseOK(a Ref, localpart, domain string) bool {
 	if a.URL == "" {
-		return
+		return false
 	}
 	req, err := a.request(http.MethodDelete, "/identity/"+localpart+"?domain="+url.QueryEscape(domain), nil)
 	if err != nil {
-		return
+		return false
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return
+		return false
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusForbidden {
 		log.Printf("[anchor] REFUSED THIS RELAY (%s) on release of %s@%s — check anchor_token", a.URL, localpart, domain)
+		return false
 	}
-	resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
